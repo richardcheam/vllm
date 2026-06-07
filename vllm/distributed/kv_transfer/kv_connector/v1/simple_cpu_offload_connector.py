@@ -3,6 +3,7 @@
 """SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -15,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
@@ -40,6 +42,44 @@ logger = init_logger(__name__)
 
 # Default CPU capacity: 8 GB
 DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
+
+
+@dataclass
+class SimpleCPUOffloadConnectorStats(KVConnectorStats):
+    _activity_keys: tuple[str, ...] = (
+        "offload_pending_store_events",
+        "offload_pending_load_reqs",
+        "offload_pending_store_reqs",
+        "offload_store_events",
+        "offload_load_events",
+        "offload_store_blocks",
+        "offload_load_blocks",
+        "offload_store_bytes",
+        "offload_load_bytes",
+    )
+
+    def reset(self):
+        self.data = {}
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        merged = dict(self.data)
+        for key, value in other.data.items():
+            if isinstance(value, (int, float)):
+                merged[key] = merged.get(key, 0) + value
+            else:
+                merged[key] = value
+        self.data = merged
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        return {
+            key: value
+            for key, value in self.data.items()
+            if isinstance(value, (int, float))
+        }
+
+    def is_empty(self) -> bool:
+        return not any(self.data.get(key, 0) for key in self._activity_keys)
 
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -75,6 +115,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             cpu_capacity_per_rank = explicit
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
+        debug_single_request_swap = bool(
+            extra_config.get("debug_single_request_swap", False)
+        )
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
@@ -88,11 +131,12 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
-            "per_rank=%.2f GB, world_size=%d, mode=%s",
+            "per_rank=%.2f GB, world_size=%d, mode=%s, debug_single_request_swap=%s",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
             "lazy" if lazy_offload else "eager",
+            debug_single_request_swap,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -101,6 +145,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config,
                 cpu_capacity_per_rank,
                 lazy_offload=lazy_offload,
+                debug_single_request_swap=debug_single_request_swap,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
@@ -233,10 +278,32 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return self.scheduler_manager.has_pending_stores()
         return False
 
+    # NOTE: New API only for proactive VLT telemetry in Scheduler.
+    def get_estimated_swap_bandwidth_bytes_per_s(self) -> float | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_estimated_swap_bandwidth_bytes_per_s()
+        return None
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         if self.scheduler_manager is not None:
             return self.scheduler_manager.take_events()
         return []
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.scheduler_manager is None:
+            return None
+        stats = SimpleCPUOffloadConnectorStats(
+            data=self.scheduler_manager.take_telemetry_stats()
+        )
+        if stats.is_empty():
+            return None
+        return stats
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return SimpleCPUOffloadConnectorStats(data=data or {})
 
     def reset_cache(self) -> bool | None:
         raise NotImplementedError(

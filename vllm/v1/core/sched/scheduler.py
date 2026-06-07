@@ -50,6 +50,7 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched.vlt import VLTInputs, compute_vlt_score
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -384,6 +385,17 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        proactive_preempted_req_ids: set[str] = set()
+        preempted_during_running_loop = False
+        proactive_preempted_reqs = self._maybe_preempt_for_proactive_swap(
+            scheduled_timestamp
+        )
+        if proactive_preempted_reqs:
+            preempted_reqs.extend(proactive_preempted_reqs)
+            proactive_preempted_req_ids.update(
+                req.request_id for req in proactive_preempted_reqs
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -504,6 +516,7 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
+                    preempted_during_running_loop = True
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -565,7 +578,10 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            (not preempted_reqs or not preempted_during_running_loop)
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -577,6 +593,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if request_id in proactive_preempted_req_ids:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -962,6 +983,188 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _is_proactive_swap_candidate(self, request: Request) -> bool:
+        if request.status != RequestStatus.RUNNING:
+            return False
+        if request.num_output_placeholders > 0:
+            return False
+        if request.spec_token_ids:
+            return False
+        if self._has_shared_kv_cache_blocks(request):
+            return False
+        remaining_tokens = request.num_tokens - request.num_computed_tokens
+        if remaining_tokens == 1:
+            return True
+        if remaining_tokens <= 0:
+            return False
+        if request.is_prefill_chunk or request.num_output_tokens == 0:
+            return False
+        return remaining_tokens <= self.block_size
+
+    def _has_shared_kv_cache_blocks(self, request: Request) -> bool:
+        try:
+            blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
+        except KeyError:
+            return True
+
+        return any(
+            block.ref_cnt > 1 and not block.is_null for group in blocks for block in group
+        )
+
+    def _estimate_request_swap_bytes(self, request: Request) -> int:
+        try:
+            blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
+        except KeyError:
+            return 0
+
+        num_blocks = sum(
+            1
+            for group in blocks
+            for block in group
+            if block.block_hash is not None and not block.is_null
+        )
+        if num_blocks <= 0 or self.kv_cache_config.num_blocks <= 0:
+            return 0
+
+        total_bytes = sum(t.size for t in self.kv_cache_config.kv_cache_tensors)
+        if total_bytes <= 0:
+            return 0
+
+        bytes_per_block = total_bytes // self.kv_cache_config.num_blocks
+        return num_blocks * bytes_per_block
+
+    def _estimate_vlt_latencies(
+        self, request: Request, now_s: float
+    ) -> tuple[float | None, float | None]:
+        time_in_system = max(now_s - request.arrival_time, 0.0)
+
+        first_token_ts = request.first_generated_token_ts
+        last_token_ts = request.last_generated_token_ts
+        num_output_tokens = request.num_output_tokens
+
+        if num_output_tokens == 0:
+            return time_in_system, None
+
+        predicted_ttft_s = None
+        if first_token_ts is not None:
+            predicted_ttft_s = max(first_token_ts - request.arrival_time, 0.0)
+
+        if (
+            num_output_tokens > 1
+            and first_token_ts is not None
+            and last_token_ts is not None
+        ):
+            decode_elapsed = max(last_token_ts - first_token_ts, 0.0)
+            predicted_tbt_s = decode_elapsed / (num_output_tokens - 1)
+        elif first_token_ts is not None:
+            predicted_tbt_s = max(now_s - first_token_ts, 0.0)
+        else:
+            predicted_tbt_s = time_in_system / max(num_output_tokens, 1)
+
+        return predicted_ttft_s, predicted_tbt_s
+
+    def _select_proactive_swap_victim(self, candidates: list[Request]) -> Request:
+        use_vlt = (
+            self.scheduler_config.vlt_alpha > 0
+            or self.scheduler_config.vlt_beta_bandwidth > 0
+            or self.scheduler_config.vlt_beta_future > 0
+            or self.scheduler_config.slo_ttft is not None
+            or self.scheduler_config.slo_tbt is not None
+        )
+
+        if not use_vlt:
+            if self.policy == SchedulingPolicy.PRIORITY:
+                return max(candidates, key=lambda r: (r.priority, r.arrival_time))
+            return candidates[-1]
+
+        now = time.monotonic()
+        default_bandwidth_bytes_per_s = 50 * (1024**3)
+        bandwidth_bytes_per_s = default_bandwidth_bytes_per_s
+        get_estimated_bw = getattr(
+            self.connector, "get_estimated_swap_bandwidth_bytes_per_s", None
+        )
+        if callable(get_estimated_bw):
+            estimated_bw = get_estimated_bw()
+            if isinstance(estimated_bw, (int, float)) and estimated_bw > 0:
+                bandwidth_bytes_per_s = float(estimated_bw)
+        running_index = {req.request_id: idx for idx, req in enumerate(self.running)}
+
+        scored: list[tuple[float, tuple[float, float, str], Request]] = []
+        for req in candidates:
+            predicted_ttft_s, predicted_tbt_s = self._estimate_vlt_latencies(req, now)
+            time_in_system = max(now - req.arrival_time, 0.0)
+
+            inputs = VLTInputs(
+                predicted_ttft_s=predicted_ttft_s,
+                predicted_tbt_s=predicted_tbt_s,
+                predicted_future_delay_s=time_in_system,
+                swap_bytes=self._estimate_request_swap_bytes(req),
+                swap_bandwidth_bytes_per_s=bandwidth_bytes_per_s,
+            )
+
+            score = compute_vlt_score(
+                inputs,
+                alpha=self.scheduler_config.vlt_alpha,
+                beta_bandwidth=self.scheduler_config.vlt_beta_bandwidth,
+                beta_future=self.scheduler_config.vlt_beta_future,
+                slo_ttft=self.scheduler_config.slo_ttft,
+                slo_tbt=self.scheduler_config.slo_tbt,
+            )
+
+            if self.policy == SchedulingPolicy.PRIORITY:
+                tie_break = (req.priority, req.arrival_time, req.request_id)
+            else:
+                tie_break = (
+                    -float(running_index.get(req.request_id, 0)),
+                    0.0,
+                    req.request_id,
+                )
+            scored.append((score, tie_break, req))
+
+        return min(scored, key=lambda item: (item[0], item[1]))[2]
+
+    def _maybe_preempt_for_proactive_swap(self, timestamp: float) -> list[Request]:
+        budget = self.scheduler_config.proactive_swap_budget
+        if budget <= 0:
+            return []
+        if self._pause_state != PauseState.UNPAUSED:
+            return []
+        if not self.waiting and not self.skipped_waiting:
+            return []
+
+        kv_cfg = self.vllm_config.kv_transfer_config
+        if kv_cfg is None or kv_cfg.kv_connector != "SimpleCPUOffloadConnector":
+            return []
+        if not bool(kv_cfg.kv_connector_extra_config.get("lazy_offload", False)):
+            return []
+        if self.connector is None:
+            return []
+
+        has_pending = getattr(self.connector, "has_pending_transfers", None)
+        if callable(has_pending) and has_pending():
+            return []
+
+        target_free = min(
+            budget,
+            max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0),
+        )
+        if target_free <= 0:
+            return []
+        if self.kv_cache_manager.block_pool.get_num_free_blocks() >= target_free:
+            return []
+
+        candidates = [
+            req for req in self.running if self._is_proactive_swap_candidate(req)
+        ]
+        if not candidates:
+            return []
+
+        victim = self._select_proactive_swap_victim(candidates)
+
+        self.running.remove(victim)
+        self._preempt_request(victim, timestamp)
+        return [victim]
+
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
 
@@ -1323,10 +1526,13 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
         )
-        if kv_connector_stats and self.connector:
+        if self.connector:
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
-                kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+                if kv_connector_stats:
+                    kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+                else:
+                    kv_connector_stats = kv_stats
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1406,6 +1612,7 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                request.record_generated_tokens_timing(len(new_token_ids))
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -1960,11 +2167,43 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        waiting_statuses = itertools.chain(self.waiting, self.skipped_waiting)
+        num_waiting_for_remote_kv_reqs = 0
+        num_waiting_for_structured_output_reqs = 0
+        num_waiting_for_streaming_reqs = 0
+        for req in waiting_statuses:
+            if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                num_waiting_for_remote_kv_reqs += 1
+            elif req.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                num_waiting_for_structured_output_reqs += 1
+            elif req.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                num_waiting_for_streaming_reqs += 1
+
+        num_preempted_reqs = sum(
+            1 for req in self.requests.values() if req.status == RequestStatus.PREEMPTED
+        )
+        kv_total_blocks = max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0)
+        kv_free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        kv_used_blocks = max(kv_total_blocks - kv_free_blocks, 0)
         return SchedulerStats(
+            num_active_reqs=len(self.requests),
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
+            num_preempted_reqs=num_preempted_reqs,
+            num_waiting_for_remote_kv_reqs=num_waiting_for_remote_kv_reqs,
+            num_waiting_for_structured_output_reqs=(
+                num_waiting_for_structured_output_reqs
+            ),
+            num_waiting_for_streaming_reqs=num_waiting_for_streaming_reqs,
+            num_pending_kv_transfer_reqs=(
+                len(self.finished_recving_kv_req_ids) + len(self.failed_recving_kv_req_ids)
+            ),
+            num_failed_kv_transfer_reqs=len(self.failed_recving_kv_req_ids),
             kv_cache_usage=self.kv_cache_manager.usage,
+            kv_cache_total_blocks=kv_total_blocks,
+            kv_cache_used_blocks=kv_used_blocks,
+            kv_cache_free_blocks=kv_free_blocks,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

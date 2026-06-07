@@ -675,6 +675,36 @@ class VllmConfig:
         Right now, this function reads the offloading settings from
         CacheConfig and configures the KVTransferConfig accordingly.
         """
+        if self.cache_config.swap_cpu_memory_gb is not None:
+            if self.cache_config.swap_cpu_memory_gb <= 0:
+                raise ValueError("swap_cpu_memory_gb must be > 0 when provided")
+
+            if self.kv_transfer_config is None:
+                self.kv_transfer_config = KVTransferConfig()
+
+            # Route SuperInfer CPU swap budget through the simple offload
+            # connector so allocator capacity is enforced by cpu_bytes_to_use.
+            self.kv_transfer_config.kv_connector = "SimpleCPUOffloadConnector"
+            self.kv_transfer_config.kv_connector_extra_config.update(
+                {
+                    "cpu_bytes_to_use": self.cache_config.swap_cpu_memory_gb * (1 << 30),
+                    # SuperInfer mode assumes scheduler-side autonomous
+                    # scanning/offload decisions.
+                    "lazy_offload": True,
+                    # Step-6 debug guard: force minimal single-request transfer
+                    # granularity while validating swap correctness.
+                    "debug_single_request_swap": bool(
+                        self.scheduler_config.proactive_swap_budget > 0
+                    ),
+                }
+            )
+            self.kv_transfer_config.kv_role = "kv_both"
+            logger.info(
+                "Enabling SimpleCPUOffloadConnector from --swap-cpu-memory-gb=%.3f GiB",
+                self.cache_config.swap_cpu_memory_gb,
+            )
+            return
+
         # KV offloading is only activated when kv_offloading_size is set.
         if (kv_offloading_size := self.cache_config.kv_offloading_size) is None:
             return

@@ -667,7 +667,18 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    swap_cpu_memory_gb: float | None = CacheConfig.swap_cpu_memory_gb
+    swapper_block_first: bool = CacheConfig.swapper_block_first
+    pin_memory_fix: bool = CacheConfig.pin_memory_fix
+    prefix_cache_fix: bool = CacheConfig.prefix_cache_fix
     tokens_only: bool = False
+
+    proactive_swap_budget: int = SchedulerConfig.proactive_swap_budget
+    vlt_alpha: float = SchedulerConfig.vlt_alpha
+    vlt_beta_bandwidth: float = SchedulerConfig.vlt_beta_bandwidth
+    vlt_beta_future: float = SchedulerConfig.vlt_beta_future
+    slo_ttft: float | None = SchedulerConfig.slo_ttft
+    slo_tbt: float | None = SchedulerConfig.slo_tbt
 
     shutdown_timeout: int = 0
 
@@ -1106,6 +1117,16 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        cache_group.add_argument(
+            "--swap-cpu-memory-gb", **cache_kwargs["swap_cpu_memory_gb"]
+        )
+        cache_group.add_argument(
+            "--swapper-block-first", **cache_kwargs["swapper_block_first"]
+        )
+        cache_group.add_argument("--pin-memory-fix", **cache_kwargs["pin_memory_fix"])
+        cache_group.add_argument(
+            "--prefix-cache-fix", **cache_kwargs["prefix_cache_fix"]
+        )
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -1327,6 +1348,18 @@ class EngineArgs:
             "--scheduler-reserve-full-isl",
             **scheduler_kwargs["scheduler_reserve_full_isl"],
         )
+        scheduler_group.add_argument(
+            "--proactive-swap-budget", **scheduler_kwargs["proactive_swap_budget"]
+        )
+        scheduler_group.add_argument("--vlt-alpha", **scheduler_kwargs["vlt_alpha"])
+        scheduler_group.add_argument(
+            "--vlt-beta-bandwidth", **scheduler_kwargs["vlt_beta_bandwidth"]
+        )
+        scheduler_group.add_argument(
+            "--vlt-beta-future", **scheduler_kwargs["vlt_beta_future"]
+        )
+        scheduler_group.add_argument("--slo-ttft", **scheduler_kwargs["slo_ttft"])
+        scheduler_group.add_argument("--slo-tbt", **scheduler_kwargs["slo_tbt"])
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
@@ -1667,6 +1700,10 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            swap_cpu_memory_gb=self.swap_cpu_memory_gb,
+            swapper_block_first=self.swapper_block_first,
+            pin_memory_fix=self.pin_memory_fix,
+            prefix_cache_fix=self.prefix_cache_fix,
         )
 
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).
@@ -1943,6 +1980,12 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            proactive_swap_budget=self.proactive_swap_budget,
+            vlt_alpha=self.vlt_alpha,
+            vlt_beta_bandwidth=self.vlt_beta_bandwidth,
+            vlt_beta_future=self.vlt_beta_future,
+            slo_ttft=self.slo_ttft,
+            slo_tbt=self.slo_tbt,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

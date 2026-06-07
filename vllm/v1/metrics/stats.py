@@ -171,16 +171,29 @@ class KVCacheEvictionEvent:
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
+    num_active_reqs: int = 0
+    """Number of active (unfinished) requests tracked by the scheduler."""
+
     num_running_reqs: int = 0
 
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
+    num_preempted_reqs: int = 0
+
+    num_waiting_for_remote_kv_reqs: int = 0
+    num_waiting_for_structured_output_reqs: int = 0
+    num_waiting_for_streaming_reqs: int = 0
+    num_pending_kv_transfer_reqs: int = 0
+    num_failed_kv_transfer_reqs: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    kv_cache_total_blocks: int = 0
+    kv_cache_used_blocks: int = 0
+    kv_cache_free_blocks: int = 0
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None

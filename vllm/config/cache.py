@@ -175,6 +175,22 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    swap_cpu_memory_gb: float | None = None
+    """SuperInfer/GH200 CPU DRAM KV swap budget in GiB.
+    When set, this enables the simple CPU offload connector path."""
+
+    swapper_block_first: bool = False
+    """SuperInfer/GH200 no-op flag for a future block-first CPU KV layout.
+    This is parsed and stored only; it does not change KV cache layout yet."""
+
+    pin_memory_fix: bool = False
+    """SuperInfer/GH200 no-op flag for a future large pinned-memory allocation
+    workaround. This is parsed and stored only."""
+
+    prefix_cache_fix: bool = False
+    """SuperInfer/GH200 no-op flag for a future prefix-cache safety guard.
+    This is parsed and stored only; it does not alter prefix caching yet."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -205,6 +221,11 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # SuperInfer/GH200 runtime knobs do not affect compiled graph shape.
+            "swap_cpu_memory_gb",
+            "swapper_block_first",
+            "pin_memory_fix",
+            "prefix_cache_fix",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

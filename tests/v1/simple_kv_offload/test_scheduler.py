@@ -94,7 +94,10 @@ def _make_kv_cache_config(
     )
 
 
-def _make_vllm_config(block_size: int = BLOCK_SIZE) -> VllmConfig:
+def _make_vllm_config(
+    block_size: int = BLOCK_SIZE,
+    proactive_swap_budget: int = 0,
+) -> VllmConfig:
     """Minimal VllmConfig for scheduler tests (no GPU)."""
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -108,6 +111,7 @@ def _make_vllm_config(block_size: int = BLOCK_SIZE) -> VllmConfig:
         max_model_len=10000,
         enable_chunked_prefill=True,
         is_encoder_decoder=False,
+        proactive_swap_budget=proactive_swap_budget,
     )
     cache_config = CacheConfig(
         block_size=block_size,
@@ -143,10 +147,14 @@ def make_scheduler(
     num_gpu_blocks: int = 16,
     num_groups: int = 1,
     lazy: bool = False,
+    debug_single_request_swap: bool = False,
+    proactive_swap_budget: int = 0,
 ) -> SchedulerFixture:
     """Build a SimpleCPUOffloadScheduler with small block pools."""
     kv_cache_config = _make_kv_cache_config(num_gpu_blocks, num_groups)
-    vllm_config = _make_vllm_config()
+    vllm_config = _make_vllm_config(
+        proactive_swap_budget=proactive_swap_budget,
+    )
     cpu_capacity_bytes = _BYTES_PER_BLOCK * num_cpu_blocks * num_groups
 
     sched = SimpleCPUOffloadScheduler(
@@ -154,6 +162,7 @@ def make_scheduler(
         kv_cache_config=kv_cache_config,
         cpu_capacity_bytes=cpu_capacity_bytes,
         lazy_offload=lazy,
+        debug_single_request_swap=debug_single_request_swap,
     )
 
     # Build a real GPU block pool and bind it
@@ -380,10 +389,12 @@ def test_eager_store_and_load_roundtrip() -> None:
         block_hasher=req._block_hasher,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
-    assert hit_tokens == num_blocks * BLOCK_SIZE
+    # get_num_new_matched_tokens intentionally keeps one token for local
+    # recomputation (request.num_tokens - 1), so two full blocks hit as one.
+    assert hit_tokens == BLOCK_SIZE
     assert is_async is True
 
-    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(num_blocks)
+    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(1)
     kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
@@ -394,8 +405,172 @@ def test_eager_store_and_load_roundtrip() -> None:
     )
     meta2 = sched.build_connector_meta(sched_out2)
     assert meta2.load_event >= 0, "Expected a load event to be assigned"
-    assert len(meta2.load_gpu_blocks) > 0
-    assert len(meta2.load_cpu_blocks) == len(meta2.load_gpu_blocks)
+    assert len(meta2.load_gpu_blocks) == 1
+    assert len(meta2.load_cpu_blocks) == 1
+
+
+def test_simple_offload_telemetry_stats_roundtrip() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: 2 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event >= 0
+
+    stats = sched.telemetry_stats
+    assert stats["offload_store_events"] == 1
+    assert stats["offload_store_blocks"] > 0
+    assert stats["offload_store_bytes"] > 0
+    assert stats["offload_pending_store_events"] >= 1
+
+    taken = sched.take_telemetry_stats()
+    assert taken["offload_store_events"] == 1
+    assert taken["offload_store_blocks"] > 0
+
+    reset_stats = sched.telemetry_stats
+    assert reset_stats["offload_store_events"] == 0
+    assert reset_stats["offload_store_blocks"] == 0
+    assert reset_stats["offload_store_bytes"] == 0
+
+
+def test_simple_offload_estimated_swap_bandwidth_updates() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    assert sched.get_estimated_swap_bandwidth_bytes_per_s() is None
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    store_out = make_scheduler_output(
+        {req.request_id: 2 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    store_meta = sched.build_connector_meta(store_out)
+    assert store_meta.store_event >= 0
+    simulate_store_completion(sched, store_meta.store_event)
+
+    estimated_after_store = sched.get_estimated_swap_bandwidth_bytes_per_s()
+    assert estimated_after_store is not None
+    assert estimated_after_store > 0
+
+    # Reset estimate to verify that load completion also updates it.
+    sched._estimated_swap_bandwidth_bytes_per_s = None
+
+    req2 = Request(
+        request_id="req-bandwidth-load",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == BLOCK_SIZE
+    assert is_async is True
+
+    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(1)
+    kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
+    sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
+    load_out = make_scheduler_output(
+        {req2.request_id: 1},
+        new_reqs={req2.request_id: kv_blocks2.get_block_ids()},
+    )
+    load_meta = sched.build_connector_meta(load_out)
+    assert load_meta.load_event >= 0
+
+    simulate_load_completion(sched, {req2.request_id})
+
+    estimated_after_load = sched.get_estimated_swap_bandwidth_bytes_per_s()
+    assert estimated_after_load is not None
+    assert estimated_after_load > 0
+
+    stats = sched.telemetry_stats
+    assert stats["offload_estimated_swap_bandwidth_bytes_per_s"] > 0
+
+
+def test_debug_single_request_swap_limits_store_and_load_to_one_request() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=False,
+        debug_single_request_swap=True,
+    )
+    sched = fix.scheduler
+
+    req_a = make_request(num_blocks=2, request_id="req-debug-a")
+    req_b = make_request(num_blocks=2, request_id="req-debug-b")
+
+    kv_blocks_a = _alloc_and_register(fix, req_a, 2)
+    kv_blocks_b = _alloc_and_register(fix, req_b, 2)
+    sched.update_state_after_alloc(req_a, kv_blocks_a, num_external_tokens=0)
+    sched.update_state_after_alloc(req_b, kv_blocks_b, num_external_tokens=0)
+
+    sched_out = make_scheduler_output(
+        {
+            req_a.request_id: 2 * BLOCK_SIZE,
+            req_b.request_id: 2 * BLOCK_SIZE,
+        },
+        new_reqs={
+            req_a.request_id: kv_blocks_a.get_block_ids(),
+            req_b.request_id: kv_blocks_b.get_block_ids(),
+        },
+    )
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 2
+    assert len(meta.store_cpu_blocks) == 2
+    assert meta.store_event in sched._store_event_to_reqs
+    assert len(sched._store_event_to_reqs[meta.store_event]) == 1
+
+    simulate_store_completion(sched, meta.store_event)
+
+    req_a2 = Request(
+        request_id="req-debug-a-reload",
+        prompt_token_ids=req_a.prompt_token_ids,
+        sampling_params=req_a.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req_a._block_hasher,
+    )
+    req_b2 = Request(
+        request_id="req-debug-b-reload",
+        prompt_token_ids=req_b.prompt_token_ids,
+        sampling_params=req_b.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req_b._block_hasher,
+    )
+
+    hit_a, async_a = sched.get_num_new_matched_tokens(req_a2, num_computed_tokens=0)
+    hit_b, async_b = sched.get_num_new_matched_tokens(req_b2, num_computed_tokens=0)
+    # get_num_new_matched_tokens intentionally keeps one token for local
+    # recomputation (request.num_tokens - 1), so two full blocks hit as one.
+    assert hit_a == BLOCK_SIZE
+    assert async_a is True
+    assert hit_b == 0
+    assert async_b is False
+
+    gpu_blocks_a2 = fix.gpu_block_pool.get_new_blocks(1)
+    kv_blocks_a2 = KVCacheBlocks(blocks=(gpu_blocks_a2,))
+    sched.update_state_after_alloc(req_a2, kv_blocks_a2, num_external_tokens=hit_a)
+
+    meta2 = sched.build_connector_meta(
+        make_scheduler_output(
+            {req_a2.request_id: 1},
+            new_reqs={req_a2.request_id: kv_blocks_a2.get_block_ids()},
+        )
+    )
+    assert meta2.load_event >= 0
+    assert len(meta2.load_gpu_blocks) == 1
+    assert len(meta2.load_cpu_blocks) == 1
+    assert len(meta2.load_event_to_reqs[meta2.load_event]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +599,7 @@ def test_lazy_store_and_load_roundtrip() -> None:
     The lazy scanner offloads them to CPU.  Re-scheduling the old request
     triggers a CPU cache hit + load.
 
-    GPU pool: 8 blocks (7 usable).  _target_free = ceil(64/16) = 4.
+    GPU pool: 8 blocks (7 usable).
     """
     fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=8, lazy=True)
     sched = fix.scheduler
@@ -463,8 +638,10 @@ def test_lazy_store_and_load_roundtrip() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req_old2, num_computed_tokens=0
     )
-    assert hit_tokens == num_blocks * BLOCK_SIZE, (
-        f"Expected {num_blocks * BLOCK_SIZE} hit tokens, got {hit_tokens}"
+    # get_num_new_matched_tokens intentionally keeps one token for local
+    # recomputation (request.num_tokens - 1), so two full blocks hit as one.
+    assert hit_tokens == BLOCK_SIZE, (
+        f"Expected {BLOCK_SIZE} hit tokens, got {hit_tokens}"
     )
     assert is_async is True
 
@@ -479,6 +656,35 @@ def test_lazy_store_and_load_roundtrip() -> None:
     meta2 = sched.build_connector_meta(sched_out2)
     assert meta2.load_event >= 0, "Expected a load event to be assigned"
     assert len(meta2.load_gpu_blocks) > 0
+
+
+def test_lazy_proactive_swap_budget_overrides_scan_depth() -> None:
+    """When proactive budget is set, lazy scanner stores only budgeted blocks."""
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=1,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=2)
+    gpu_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    gpu_pool.free_blocks(gpu_blocks)
+
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 1
+    assert len(meta.store_cpu_blocks) == 1
+
+    stats = sched.telemetry_stats
+    assert stats["offload_lazy_target_free_blocks"] == 1
+    assert stats["offload_proactive_swap_budget"] == 1
+
+    simulate_store_completion(sched, meta.store_event)
+    gpu_pool.free_blocks(fillers)
 
 
 # ---------------------------------------------------------------------------
@@ -1086,12 +1292,10 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req2, num_computed_tokens=gpu_local_computed
     )
-    # CPU should hit blocks 2,3 (not 4,5 — those are beyond the CPU range).
-    num_cpu_hit_blocks = 2
-    # Actually CPU has all 6 stored; it returns hits starting from position 2.
-    # The number of CPU hit blocks = min(remaining request blocks, CPU cached).
-    # Here remaining = 6 - 2 = 4 blocks are in CPU, so hit = 4 * BLOCK_SIZE.
-    num_cpu_hit_blocks = 4
+    # CPU has all remaining blocks stored, but get_num_new_matched_tokens keeps
+    # one token for local recomputation. Starting after 2 locally-computed GPU
+    # blocks, that permits 3 full CPU blocks to be loaded.
+    num_cpu_hit_blocks = 3
     assert hit_tokens == num_cpu_hit_blocks * BLOCK_SIZE, (
         f"Expected {num_cpu_hit_blocks * BLOCK_SIZE} CPU hit tokens, got {hit_tokens}"
     )

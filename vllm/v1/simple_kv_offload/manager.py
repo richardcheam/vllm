@@ -3,6 +3,8 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import math
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -64,6 +66,12 @@ class StoreRequestState:
     finished: bool = False
 
 
+@dataclass
+class TransferPerfState:
+    started_at_s: float
+    bytes_to_copy: int
+
+
 class SimpleCPUOffloadScheduler:
     """Scheduler-side manager for CPU offloading."""
 
@@ -73,6 +81,7 @@ class SimpleCPUOffloadScheduler:
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
         lazy_offload: bool = False,
+        debug_single_request_swap: bool = False,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -97,10 +106,11 @@ class SimpleCPUOffloadScheduler:
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
 
         logger.info(
-            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
+            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s, debug_single_request_swap=%s)",
             self.num_cpu_blocks,
             cpu_capacity_bytes / (1024**3),
             "lazy" if lazy_offload else "eager",
+            debug_single_request_swap,
         )
 
         # TODO (yifan): maybe need to enable kv_cache_events and metrics_collector here.
@@ -133,15 +143,33 @@ class SimpleCPUOffloadScheduler:
 
         # Store metadata
         self._lazy_mode = lazy_offload
+        self._debug_single_request_swap = debug_single_request_swap
+        self._proactive_swap_budget = max(
+            0, int(vllm_config.scheduler_config.proactive_swap_budget)
+        )
         # Lazy mode: use a cursor to track the last scanned block in the GPU free queue.
         self._cursor: KVCacheBlock | None = None
+        estimated_target_free = 0
         if self._lazy_mode:
-            self._target_free = self._estimate_lazy_target_blocks(
+            estimated_target_free = self._estimate_lazy_target_blocks(
                 kv_cache_config,
                 vllm_config.scheduler_config.max_num_batched_tokens,
             )
+            if self._proactive_swap_budget > 0:
+                # Step-6 guarded rollout: allow proactive budget to directly
+                # control lazy offload scan depth. This turns the budget into
+                # an active scheduler-side movement knob when swap is enabled.
+                self._target_free = self._proactive_swap_budget
+            else:
+                self._target_free = estimated_target_free
         else:
             self._target_free = 0
+        logger.info(
+            "SimpleCPUOffloadScheduler: lazy_target_free_blocks=%d (estimated=%d, proactive_swap_budget=%d)",
+            self._target_free,
+            estimated_target_free,
+            self._proactive_swap_budget,
+        )
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
         # Eager mode only
         self._reqs_to_store: dict[str, StoreRequestState] = {}
@@ -155,6 +183,87 @@ class SimpleCPUOffloadScheduler:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
+
+        # Telemetry-only counters.
+        self._telemetry_store_events: int = 0
+        self._telemetry_load_events: int = 0
+        self._telemetry_store_blocks: int = 0
+        self._telemetry_load_blocks: int = 0
+        self._telemetry_store_bytes: int = 0
+        self._telemetry_load_bytes: int = 0
+
+        # Rolling estimate used by guarded proactive VLT scoring.
+        self._estimated_swap_bandwidth_bytes_per_s: float | None = None
+        self._bandwidth_ema_alpha = 0.2
+        self._store_event_perf: dict[int, TransferPerfState] = {}
+        self._load_event_perf: dict[int, TransferPerfState] = {}
+
+    @property
+    def telemetry_stats(self) -> dict[str, int]:
+        return {
+            "offload_pending_store_events": len(self._store_event_to_blocks),
+            "offload_pending_load_reqs": len(self._reqs_to_load),
+            "offload_pending_store_reqs": len(self._reqs_to_store),
+            "offload_store_events": self._telemetry_store_events,
+            "offload_load_events": self._telemetry_load_events,
+            "offload_store_blocks": self._telemetry_store_blocks,
+            "offload_load_blocks": self._telemetry_load_blocks,
+            "offload_store_bytes": self._telemetry_store_bytes,
+            "offload_load_bytes": self._telemetry_load_bytes,
+            "offload_cpu_total_blocks": self.num_cpu_blocks,
+            "offload_cpu_free_blocks": self.cpu_block_pool.get_num_free_blocks(),
+            "offload_cpu_used_blocks": self.num_cpu_blocks
+            - self.cpu_block_pool.get_num_free_blocks(),
+            "offload_lazy_target_free_blocks": self._target_free,
+            "offload_proactive_swap_budget": self._proactive_swap_budget,
+            "offload_estimated_swap_bandwidth_bytes_per_s": int(
+                self._estimated_swap_bandwidth_bytes_per_s or 0
+            ),
+        }
+
+    def take_telemetry_stats(self) -> dict[str, int]:
+        stats = self.telemetry_stats
+        self._telemetry_store_events = 0
+        self._telemetry_load_events = 0
+        self._telemetry_store_blocks = 0
+        self._telemetry_load_blocks = 0
+        self._telemetry_store_bytes = 0
+        self._telemetry_load_bytes = 0
+        return stats
+
+    def get_estimated_swap_bandwidth_bytes_per_s(self) -> float | None:
+        return self._estimated_swap_bandwidth_bytes_per_s
+
+    def _update_estimated_swap_bandwidth(
+        self, bytes_to_copy: int, elapsed_s: float
+    ) -> None:
+        if bytes_to_copy <= 0 or elapsed_s <= 0:
+            return
+
+        measured = bytes_to_copy / elapsed_s
+        if not math.isfinite(measured) or measured <= 0:
+            return
+
+        current = self._estimated_swap_bandwidth_bytes_per_s
+        if current is None:
+            self._estimated_swap_bandwidth_bytes_per_s = measured
+            return
+
+        alpha = self._bandwidth_ema_alpha
+        self._estimated_swap_bandwidth_bytes_per_s = (
+            (1.0 - alpha) * current + alpha * measured
+        )
+
+    def _count_transfer_bytes(self, num_blocks: int) -> int:
+        if num_blocks <= 0:
+            return 0
+        if self.cpu_kv_cache_config.num_blocks <= 0:
+            return 0
+        total_bytes = sum(t.size for t in self.cpu_kv_cache_config.kv_cache_tensors)
+        if total_bytes <= 0:
+            return 0
+        bytes_per_block = total_bytes // self.cpu_kv_cache_config.num_blocks
+        return num_blocks * bytes_per_block
 
     @staticmethod
     def _derive_cpu_config(
@@ -325,9 +434,17 @@ class SimpleCPUOffloadScheduler:
         if store_gpu:
             store_event = self._store_event_counter
             self._store_event_counter += 1
+            store_bytes = self._count_transfer_bytes(len(store_gpu))
             self._store_event_to_blocks[store_event] = TransferMeta(
                 store_gpu, store_cpu
             )
+            self._store_event_perf[store_event] = TransferPerfState(
+                started_at_s=time.monotonic(),
+                bytes_to_copy=store_bytes,
+            )
+            self._telemetry_store_events += 1
+            self._telemetry_store_blocks += len(store_gpu)
+            self._telemetry_store_bytes += store_bytes
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
@@ -339,20 +456,34 @@ class SimpleCPUOffloadScheduler:
         load_event = -1
         load_gpu: list[int] = []
         load_cpu: list[int] = []
-        load_req_ids: list[str] = []
-        for req_id, load_state in self._reqs_to_load.items():
-            if load_state.load_event is not None:
-                continue
+        load_req_ids: list[str] = [
+            req_id
+            for req_id, load_state in self._reqs_to_load.items()
+            if load_state.load_event is None
+        ]
+        if self._debug_single_request_swap and load_req_ids:
+            load_req_ids = load_req_ids[:1]
+
+        for req_id in load_req_ids:
+            load_state = self._reqs_to_load[req_id]
             assert load_state.transfer_meta is not None
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
-            load_req_ids.append(req_id)
+
         if load_req_ids:
             load_event = self._load_event_counter
             self._load_event_counter += 1
+            load_bytes = self._count_transfer_bytes(len(load_gpu))
             for req_id in load_req_ids:
                 self._reqs_to_load[req_id].load_event = load_event
             self._load_event_to_reqs[load_event] = load_req_ids
+            self._load_event_perf[load_event] = TransferPerfState(
+                started_at_s=time.monotonic(),
+                bytes_to_copy=load_bytes,
+            )
+            self._telemetry_load_events += 1
+            self._telemetry_load_blocks += len(load_gpu)
+            self._telemetry_load_bytes += load_bytes
 
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
@@ -429,6 +560,10 @@ class SimpleCPUOffloadScheduler:
             node = node.next_free_block
 
         self._cursor = last_visited
+
+        if self._debug_single_request_swap and gpu_ids:
+            gpu_ids = gpu_ids[:1]
+            block_hashes = block_hashes[:1]
 
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
@@ -575,6 +710,9 @@ class SimpleCPUOffloadScheduler:
                     num_groups,
                 )
 
+                if self._debug_single_request_swap:
+                    break
+
             # Advance per-group cursors (includes cached hits + newly stored)
             for g in range(num_groups):
                 state.num_stored_blocks[g] += advanced_per_group[g]
@@ -609,6 +747,12 @@ class SimpleCPUOffloadScheduler:
         """Process a fully-completed store event."""
         transfer = self._store_event_to_blocks.pop(event_idx)
         self._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
+        perf = self._store_event_perf.pop(event_idx, None)
+        if perf is not None:
+            self._update_estimated_swap_bandwidth(
+                perf.bytes_to_copy,
+                max(time.monotonic() - perf.started_at_s, 1e-9),
+            )
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
             event_idx,
@@ -700,6 +844,7 @@ class SimpleCPUOffloadScheduler:
         if state is None:
             return
         # Remove from load event mapping (only this req, not whole event)
+        completed_event_idx: int | None = None
         if state.load_event is not None:
             reqs = self._load_event_to_reqs.get(state.load_event)
             if reqs is not None:
@@ -707,6 +852,15 @@ class SimpleCPUOffloadScheduler:
                     reqs.remove(req_id)
                 if not reqs:
                     self._load_event_to_reqs.pop(state.load_event, None)
+                    completed_event_idx = state.load_event
+
+        if completed_event_idx is not None:
+            perf = self._load_event_perf.pop(completed_event_idx, None)
+            if perf is not None:
+                self._update_estimated_swap_bandwidth(
+                    perf.bytes_to_copy,
+                    max(time.monotonic() - perf.started_at_s, 1e-9),
+                )
 
         if state.transfer_meta is not None:
             # Free CPU touch refs

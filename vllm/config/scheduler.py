@@ -154,6 +154,26 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    proactive_swap_budget: int = Field(default=0, ge=0)
+    """SuperInfer/GH200 proactive offload scan budget in blocks.
+    When CPU swap is enabled via ``swap_cpu_memory_gb``, this budget can
+    constrain lazy offload movement per scheduler step."""
+
+    vlt_alpha: float = Field(default=0.0, ge=0.0)
+    """SuperInfer/GH200 no-op flag for future VLT TBT sensitivity."""
+
+    vlt_beta_bandwidth: float = 0.0
+    """SuperInfer/GH200 no-op flag for future VLT swap-bandwidth weighting."""
+
+    vlt_beta_future: float = 0.0
+    """SuperInfer/GH200 no-op flag for future VLT future-delay weighting."""
+
+    slo_ttft: float | None = Field(default=None, gt=0.0)
+    """SuperInfer/GH200 no-op flag for future TTFT SLO seconds."""
+
+    slo_tbt: float | None = Field(default=None, gt=0.0)
+    """SuperInfer/GH200 no-op flag for future TBT SLO seconds."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

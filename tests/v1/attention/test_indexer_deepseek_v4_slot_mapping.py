@@ -25,7 +25,10 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         dtype=torch.bfloat16,
         compress_ratio=4,
     )
-    vllm_config = create_vllm_config(max_model_len=1024)
+    vllm_config = create_vllm_config(
+        model_name="facebook/opt-125m",
+        max_model_len=1024,
+    )
     builder = DeepseekV32IndexerMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
         layer_names=["dummy"],

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -27,6 +28,61 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+logger = init_logger(__name__)
+
+
+class RequestRotaryState(enum.Enum):
+    """Metadata-only state for SuperInfer-style request rotation."""
+
+    WAITING = "waiting"
+    RUNNING = "running"
+    ROTARY_PENDING_OUT = "rotary_pending_out"
+    ROTARY_SWAPPED = "rotary_swapped"
+    ROTARY_PENDING_IN = "rotary_pending_in"
+    FINISHED = "finished"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+_ROTARY_ALLOWED_TRANSITIONS: dict[RequestRotaryState, set[RequestRotaryState]] = {
+    RequestRotaryState.WAITING: {
+        RequestRotaryState.WAITING,
+        RequestRotaryState.RUNNING,
+        RequestRotaryState.ROTARY_PENDING_OUT,
+        RequestRotaryState.ROTARY_PENDING_IN,
+        RequestRotaryState.FINISHED,
+    },
+    RequestRotaryState.RUNNING: {
+        RequestRotaryState.RUNNING,
+        RequestRotaryState.WAITING,
+        RequestRotaryState.ROTARY_PENDING_OUT,
+        RequestRotaryState.FINISHED,
+    },
+    RequestRotaryState.ROTARY_PENDING_OUT: {
+        RequestRotaryState.ROTARY_PENDING_OUT,
+        RequestRotaryState.ROTARY_SWAPPED,
+        RequestRotaryState.RUNNING,
+        RequestRotaryState.FINISHED,
+    },
+    RequestRotaryState.ROTARY_SWAPPED: {
+        RequestRotaryState.ROTARY_SWAPPED,
+        RequestRotaryState.ROTARY_PENDING_IN,
+        RequestRotaryState.WAITING,
+        RequestRotaryState.FINISHED,
+    },
+    RequestRotaryState.ROTARY_PENDING_IN: {
+        RequestRotaryState.ROTARY_PENDING_IN,
+        RequestRotaryState.RUNNING,
+        RequestRotaryState.WAITING,
+        RequestRotaryState.FINISHED,
+    },
+    RequestRotaryState.FINISHED: {
+        RequestRotaryState.FINISHED,
+    },
+}
 
 
 @dataclass
@@ -92,7 +148,8 @@ class Request:
             )
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
 
-        self.status = RequestStatus.WAITING
+        self._status = RequestStatus.WAITING
+        self.rotary_state = RequestRotaryState.WAITING
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
 
@@ -163,6 +220,10 @@ class Request:
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
+        # Generation timing hints used by guarded proactive VLT scoring.
+        self.first_generated_token_ts: float | None = None
+        self.last_generated_token_ts: float | None = None
+
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
@@ -223,6 +284,62 @@ class Request:
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None
+
+    @property
+    def status(self) -> "RequestStatus":
+        return self._status
+
+    @status.setter
+    def status(self, new_status: "RequestStatus") -> None:
+        self._status = new_status
+        self._sync_rotary_state_with_status()
+
+    def set_rotary_state(
+        self,
+        new_state: RequestRotaryState,
+        *,
+        force: bool = False,
+    ) -> None:
+        if RequestStatus.is_finished(self.status):
+            assert new_state == RequestRotaryState.FINISHED, (
+                "Finished requests can only have FINISHED rotary_state"
+            )
+
+        if not force:
+            assert new_state in _ROTARY_ALLOWED_TRANSITIONS[self.rotary_state], (
+                f"Invalid rotary state transition {self.rotary_state} -> {new_state}"
+            )
+
+        if self.rotary_state != new_state:
+            logger.debug(
+                "Request %s rotary state transition %s -> %s",
+                self.request_id,
+                self.rotary_state,
+                new_state,
+            )
+            self.rotary_state = new_state
+
+    def _sync_rotary_state_with_status(self) -> None:
+        mapped = self._rotary_state_for_status(self.status)
+        if mapped != self.rotary_state:
+            logger.debug(
+                "Request %s rotary state synced %s -> %s (status=%s)",
+                self.request_id,
+                self.rotary_state,
+                mapped,
+                self.status,
+            )
+            self.rotary_state = mapped
+
+    @staticmethod
+    def _rotary_state_for_status(status: "RequestStatus") -> RequestRotaryState:
+        if RequestStatus.is_finished(status):
+            return RequestRotaryState.FINISHED
+        if status == RequestStatus.RUNNING:
+            return RequestRotaryState.RUNNING
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return RequestRotaryState.ROTARY_PENDING_IN
+        return RequestRotaryState.WAITING
 
     @property
     def num_tokens(self) -> int:
@@ -286,6 +403,18 @@ class Request:
         prefill_stats = self.prefill_stats
         self.prefill_stats = None
         return prefill_stats
+
+    def record_generated_tokens_timing(
+        self,
+        num_generated_tokens: int,
+        timestamp: float | None = None,
+    ) -> None:
+        if num_generated_tokens <= 0:
+            return
+        ts = time.monotonic() if timestamp is None else timestamp
+        if self.first_generated_token_ts is None:
+            self.first_generated_token_ts = ts
+        self.last_generated_token_ts = ts
 
     def __lt__(self, other: "Request") -> bool:
         """

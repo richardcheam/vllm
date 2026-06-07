@@ -221,6 +221,70 @@ def test_media_io_kwargs_parser(arg, expected):
     assert args.media_io_kwargs == expected
 
 
+def test_superinfer_cli_defaults_are_disabled(monkeypatch: pytest.MonkeyPatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "current_platform", CpuPlatform(), raising=False)
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args([])
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.swap_cpu_memory_gb is None
+    assert engine_args.proactive_swap_budget == 0
+    assert engine_args.swapper_block_first is False
+    assert engine_args.pin_memory_fix is False
+    assert engine_args.prefix_cache_fix is False
+    assert engine_args.vlt_alpha == 0.0
+    assert engine_args.vlt_beta_bandwidth == 0.0
+    assert engine_args.vlt_beta_future == 0.0
+    assert engine_args.slo_ttft is None
+    assert engine_args.slo_tbt is None
+
+
+def test_superinfer_noop_flags_from_cli(monkeypatch: pytest.MonkeyPatch):
+    import vllm.platforms as platforms
+    from vllm.platforms.cpu import CpuPlatform
+
+    monkeypatch.setattr(platforms, "current_platform", CpuPlatform(), raising=False)
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--swap-cpu-memory-gb",
+            "400",
+            "--proactive-swap-budget",
+            "2400",
+            "--swapper-block-first",
+            "--pin-memory-fix",
+            "--prefix-cache-fix",
+            "--vlt-alpha",
+            "3.0",
+            "--vlt-beta-bandwidth",
+            "0.5",
+            "--vlt-beta-future",
+            "0.5",
+            "--slo-ttft",
+            "5.0",
+            "--slo-tbt",
+            "0.1",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.swap_cpu_memory_gb == 400
+    assert engine_args.proactive_swap_budget == 2400
+    assert engine_args.swapper_block_first
+    assert engine_args.pin_memory_fix
+    assert engine_args.prefix_cache_fix
+    assert engine_args.vlt_alpha == 3.0
+    assert engine_args.vlt_beta_bandwidth == 0.5
+    assert engine_args.vlt_beta_future == 0.5
+    assert engine_args.slo_ttft == 5.0
+    assert engine_args.slo_tbt == 0.1
+
+
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
