@@ -236,6 +236,8 @@ def test_superinfer_cli_defaults_are_disabled(monkeypatch: pytest.MonkeyPatch):
     assert engine_args.swapper_block_first is False
     assert engine_args.pin_memory_fix is False
     assert engine_args.prefix_cache_fix is False
+    assert engine_args.superinfer_high_risk_mode is False
+    assert engine_args.gh200_topology_tuned is False
     assert engine_args.vlt_alpha == 0.0
     assert engine_args.vlt_beta_bandwidth == 0.0
     assert engine_args.vlt_beta_future == 0.0
@@ -259,6 +261,8 @@ def test_superinfer_noop_flags_from_cli(monkeypatch: pytest.MonkeyPatch):
             "--swapper-block-first",
             "--pin-memory-fix",
             "--prefix-cache-fix",
+            "--superinfer-high-risk-mode",
+            "--gh200-topology-tuned",
             "--vlt-alpha",
             "3.0",
             "--vlt-beta-bandwidth",
@@ -278,6 +282,8 @@ def test_superinfer_noop_flags_from_cli(monkeypatch: pytest.MonkeyPatch):
     assert engine_args.swapper_block_first
     assert engine_args.pin_memory_fix
     assert engine_args.prefix_cache_fix
+    assert engine_args.superinfer_high_risk_mode
+    assert engine_args.gh200_topology_tuned
     assert engine_args.vlt_alpha == 3.0
     assert engine_args.vlt_beta_bandwidth == 0.5
     assert engine_args.vlt_beta_future == 0.5

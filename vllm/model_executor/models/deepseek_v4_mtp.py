@@ -83,6 +83,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
+            prefix=maybe_prefix(prefix, "e_proj"),
             quant_config=quant_config,
         )
         self.h_proj = ReplicatedLinear(
@@ -90,6 +91,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
+            prefix=maybe_prefix(prefix, "h_proj"),
             quant_config=quant_config,
         )
 

@@ -150,6 +150,11 @@ class Request:
 
         self._status = RequestStatus.WAITING
         self.rotary_state = RequestRotaryState.WAITING
+        self.rotary_synced_blocks = 0
+        self.rotary_unsynced_blocks = 0
+        self.rotary_dirty_tail_tokens = 0
+        self.rotary_preempted_at: float | None = None
+        self.rotary_last_preempted_at: float | None = None
         self.events: list[EngineCoreEvent] = []
         self.stop_reason: int | str | None = None
 

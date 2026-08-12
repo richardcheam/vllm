@@ -671,6 +671,11 @@ class EngineArgs:
     swapper_block_first: bool = CacheConfig.swapper_block_first
     pin_memory_fix: bool = CacheConfig.pin_memory_fix
     prefix_cache_fix: bool = CacheConfig.prefix_cache_fix
+    superinfer_high_risk_mode: bool = CacheConfig.superinfer_high_risk_mode
+    gh200_topology_tuned: bool = CacheConfig.gh200_topology_tuned
+    local_cpu_pool_fraction: float = CacheConfig.local_cpu_pool_fraction
+    local_swap_bandwidth_bytes_per_s: float = CacheConfig.local_swap_bandwidth_bytes_per_s
+    remote_swap_bandwidth_bytes_per_s: float = CacheConfig.remote_swap_bandwidth_bytes_per_s
     tokens_only: bool = False
 
     proactive_swap_budget: int = SchedulerConfig.proactive_swap_budget
@@ -1126,6 +1131,26 @@ class EngineArgs:
         cache_group.add_argument("--pin-memory-fix", **cache_kwargs["pin_memory_fix"])
         cache_group.add_argument(
             "--prefix-cache-fix", **cache_kwargs["prefix_cache_fix"]
+        )
+        cache_group.add_argument(
+            "--superinfer-high-risk-mode",
+            **cache_kwargs["superinfer_high_risk_mode"],
+        )
+        cache_group.add_argument(
+            "--gh200-topology-tuned",
+            **cache_kwargs["gh200_topology_tuned"],
+        )
+        cache_group.add_argument(
+            "--local-cpu-pool-fraction",
+            **cache_kwargs["local_cpu_pool_fraction"],
+        )
+        cache_group.add_argument(
+            "--local-swap-bandwidth-bytes-per-s",
+            **cache_kwargs["local_swap_bandwidth_bytes_per_s"],
+        )
+        cache_group.add_argument(
+            "--remote-swap-bandwidth-bytes-per-s",
+            **cache_kwargs["remote_swap_bandwidth_bytes_per_s"],
         )
 
         # Model weight offload related configs
@@ -1704,6 +1729,11 @@ class EngineArgs:
             swapper_block_first=self.swapper_block_first,
             pin_memory_fix=self.pin_memory_fix,
             prefix_cache_fix=self.prefix_cache_fix,
+            superinfer_high_risk_mode=self.superinfer_high_risk_mode,
+            gh200_topology_tuned=self.gh200_topology_tuned,
+            local_cpu_pool_fraction=self.local_cpu_pool_fraction,
+            local_swap_bandwidth_bytes_per_s=self.local_swap_bandwidth_bytes_per_s,
+            remote_swap_bandwidth_bytes_per_s=self.remote_swap_bandwidth_bytes_per_s,
         )
 
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).

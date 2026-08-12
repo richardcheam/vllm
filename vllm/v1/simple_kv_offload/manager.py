@@ -26,9 +26,18 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import RequestRotaryState
+from vllm.v1.simple_kv_offload.layout import choose_layout_mode
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
+)
+from vllm.v1.simple_kv_offload.topology import (
+    Gh200TopologyMapping,
+    LocalityPoolPlanner,
+    discover_gh200_topology_mapping,
+    estimate_remote_penalty_seconds,
+    split_elapsed_ms_by_bytes,
 )
 
 if TYPE_CHECKING:
@@ -44,6 +53,8 @@ logger = init_logger(__name__)
 class TransferMeta:
     gpu_block_ids: list[int]
     cpu_block_ids: list[int]
+    cpu_block_localities: list[str] = field(default_factory=list)
+    source_gpu_rank: int = 0
 
 
 @dataclass
@@ -54,7 +65,6 @@ class LoadRequestState:
     finished: bool = False
 
 
-# NOTE: This per-request state is only used in eager mode.
 @dataclass
 class StoreRequestState:
     request: "Request"
@@ -63,6 +73,7 @@ class StoreRequestState:
     # Per-group cursors tracking how many blocks have been stored/skipped.
     num_stored_blocks: list[int]
     store_events: set[int] = field(default_factory=set)
+    finish_touched_gpu_block_ids: set[int] = field(default_factory=set)
     finished: bool = False
 
 
@@ -82,6 +93,9 @@ class SimpleCPUOffloadScheduler:
         cpu_capacity_bytes: int,
         lazy_offload: bool = False,
         debug_single_request_swap: bool = False,
+        pin_memory_fix: bool = False,
+        swapper_block_first: bool = False,
+        min_lazy_store_batch_blocks: int = 1,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -144,6 +158,60 @@ class SimpleCPUOffloadScheduler:
         # Store metadata
         self._lazy_mode = lazy_offload
         self._debug_single_request_swap = debug_single_request_swap
+        self._pin_memory_fix = pin_memory_fix
+        self._swapper_block_first = swapper_block_first
+        extra_config = (
+            vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        )
+        self._superinfer_high_risk_mode = bool(
+            vllm_config.cache_config.superinfer_high_risk_mode
+        )
+        self._gh200_topology_tuned = bool(
+            extra_config.get("gh200_topology_tuned", False)
+            or vllm_config.cache_config.gh200_topology_tuned
+        )
+        self._gpu_rank = int(vllm_config.parallel_config.rank)
+        self._local_fraction = float(
+            extra_config.get(
+                "local_cpu_pool_fraction",
+                vllm_config.cache_config.local_cpu_pool_fraction,
+            )
+        )
+        self._local_bw_bytes_per_s = float(
+            extra_config.get(
+                "local_swap_bandwidth_bytes_per_s",
+                vllm_config.cache_config.local_swap_bandwidth_bytes_per_s,
+            )
+        )
+        self._remote_bw_bytes_per_s = float(
+            extra_config.get(
+                "remote_swap_bandwidth_bytes_per_s",
+                vllm_config.cache_config.remote_swap_bandwidth_bytes_per_s,
+            )
+        )
+        self._topology_mapping: Gh200TopologyMapping = discover_gh200_topology_mapping(
+            enabled=self._gh200_topology_tuned,
+            local_cpu_pool_fraction=self._local_fraction,
+            local_bandwidth_bytes_per_s=self._local_bw_bytes_per_s,
+            remote_bandwidth_bytes_per_s=self._remote_bw_bytes_per_s,
+        )
+        for line in self._topology_mapping.to_log_lines():
+            if self._topology_mapping.fallback_mode and self._gh200_topology_tuned:
+                logger.warning(line)
+            else:
+                logger.info(line)
+        self._min_lazy_store_batch_blocks = max(1, int(min_lazy_store_batch_blocks))
+        model_arches = tuple(vllm_config.model_config.architectures or ())
+        layout_decision = choose_layout_mode(
+            self._swapper_block_first,
+            model_arches=model_arches,
+            num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
+            has_non_tensor_values=False,
+            tensor_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+            aggressive_mode=self._superinfer_high_risk_mode,
+        )
+        self._block_first_eligible_estimate = layout_decision.block_first_eligible
+        self._active_layout_mode = layout_decision.mode
         self._proactive_swap_budget = max(
             0, int(vllm_config.scheduler_config.proactive_swap_budget)
         )
@@ -171,7 +239,9 @@ class SimpleCPUOffloadScheduler:
             self._proactive_swap_budget,
         )
         self._store_event_to_blocks: dict[int, TransferMeta] = {}
-        # Eager mode only
+        # Tracks confirmed full blocks already scheduled/stored to CPU.  In
+        # lazy mode this gives us paper-style synced block residency before a
+        # later proactive preemption needs to discard GPU blocks.
         self._reqs_to_store: dict[str, StoreRequestState] = {}
         self._store_event_to_reqs: dict[int, list[str]] = {}
 
@@ -191,12 +261,45 @@ class SimpleCPUOffloadScheduler:
         self._telemetry_load_blocks: int = 0
         self._telemetry_store_bytes: int = 0
         self._telemetry_load_bytes: int = 0
+        self._telemetry_store_events_ge_16_blocks: int = 0
+        self._telemetry_store_events_lt_4_blocks: int = 0
+        self._telemetry_load_events_ge_16_blocks: int = 0
+        self._telemetry_load_events_lt_4_blocks: int = 0
 
         # Rolling estimate used by guarded proactive VLT scoring.
         self._estimated_swap_bandwidth_bytes_per_s: float | None = None
         self._bandwidth_ema_alpha = 0.2
         self._store_event_perf: dict[int, TransferPerfState] = {}
         self._load_event_perf: dict[int, TransferPerfState] = {}
+        self._store_event_localities: dict[int, list[str]] = {}
+        self._load_event_localities: dict[int, list[str]] = {}
+
+        self._locality_planner = LocalityPoolPlanner(
+            total_blocks=max(self.num_cpu_blocks - 1, 0),
+            enabled=self._gh200_topology_tuned,
+            mapping=self._topology_mapping,
+            local_fraction=self._local_fraction,
+        )
+        self._cpu_block_island_map = self._build_cpu_block_island_map()
+        logger.info(
+            "SimpleCPUOffloadScheduler locality pools rank=%d sizes=%s",
+            self._gpu_rank,
+            self._locality_planner.pool_sizes_per_island(),
+        )
+        self._pending_request_ids_by_store_event: dict[int, list[str]] = {}
+        self._pending_request_ids_by_load_event: dict[int, list[str]] = {}
+
+        self._telemetry_local_swap_out_bytes: int = 0
+        self._telemetry_local_swap_in_bytes: int = 0
+        self._telemetry_remote_swap_out_bytes: int = 0
+        self._telemetry_remote_swap_in_bytes: int = 0
+        self._telemetry_num_remote_fallbacks: int = 0
+        self._telemetry_swap_out_time_ms: float = 0.0
+        self._telemetry_swap_in_time_ms: float = 0.0
+        self._telemetry_local_swap_out_time_ms: float = 0.0
+        self._telemetry_local_swap_in_time_ms: float = 0.0
+        self._telemetry_remote_swap_out_time_ms: float = 0.0
+        self._telemetry_remote_swap_in_time_ms: float = 0.0
 
     @property
     def telemetry_stats(self) -> dict[str, int]:
@@ -210,15 +313,53 @@ class SimpleCPUOffloadScheduler:
             "offload_load_blocks": self._telemetry_load_blocks,
             "offload_store_bytes": self._telemetry_store_bytes,
             "offload_load_bytes": self._telemetry_load_bytes,
+            "offload_store_events_ge_16_blocks": self._telemetry_store_events_ge_16_blocks,
+            "offload_store_events_lt_4_blocks": self._telemetry_store_events_lt_4_blocks,
+            "offload_load_events_ge_16_blocks": self._telemetry_load_events_ge_16_blocks,
+            "offload_load_events_lt_4_blocks": self._telemetry_load_events_lt_4_blocks,
             "offload_cpu_total_blocks": self.num_cpu_blocks,
             "offload_cpu_free_blocks": self.cpu_block_pool.get_num_free_blocks(),
             "offload_cpu_used_blocks": self.num_cpu_blocks
             - self.cpu_block_pool.get_num_free_blocks(),
             "offload_lazy_target_free_blocks": self._target_free,
             "offload_proactive_swap_budget": self._proactive_swap_budget,
+            "offload_gh200_topology_fallback_mode": int(
+                self._topology_mapping.fallback_mode
+            ),
+            "offload_pin_memory_fix": int(self._pin_memory_fix),
+            "offload_swapper_block_first": int(self._swapper_block_first),
+            "offload_high_risk_mode": int(self._superinfer_high_risk_mode),
+            "offload_gh200_topology_tuned": int(self._gh200_topology_tuned),
+            "offload_gh200_topology_discovered": int(
+                self._topology_mapping.discovered
+            ),
+            "offload_gh200_gpu_rank": self._gpu_rank,
+            "offload_local_cpu_pool_blocks": self._locality_planner.local_total_blocks,
+            "offload_remote_cpu_pool_blocks": self._locality_planner.remote_total_blocks,
+            "offload_min_lazy_store_batch_blocks": self._min_lazy_store_batch_blocks,
+            "offload_block_first_eligible": int(self._block_first_eligible_estimate),
+            "offload_block_first_active": int(self._active_layout_mode == "block_first"),
             "offload_estimated_swap_bandwidth_bytes_per_s": int(
                 self._estimated_swap_bandwidth_bytes_per_s or 0
             ),
+            "local_swap_out_bytes": self._telemetry_local_swap_out_bytes,
+            "local_swap_in_bytes": self._telemetry_local_swap_in_bytes,
+            "remote_swap_out_bytes": self._telemetry_remote_swap_out_bytes,
+            "remote_swap_in_bytes": self._telemetry_remote_swap_in_bytes,
+            "num_remote_fallbacks": self._telemetry_num_remote_fallbacks,
+            "swap_out_time_ms": int(self._telemetry_swap_out_time_ms),
+            "swap_in_time_ms": int(self._telemetry_swap_in_time_ms),
+            "local_swap_out_time_ms": int(self._telemetry_local_swap_out_time_ms),
+            "local_swap_in_time_ms": int(self._telemetry_local_swap_in_time_ms),
+            "remote_swap_out_time_ms": int(self._telemetry_remote_swap_out_time_ms),
+            "remote_swap_in_time_ms": int(self._telemetry_remote_swap_in_time_ms),
+            "local_bandwidth_gbps": float(self._local_bw_bytes_per_s * 8 / 1e9),
+            "remote_bandwidth_gbps": float(self._remote_bw_bytes_per_s * 8 / 1e9),
+            f"local_swap_out_bytes_gpu_{self._gpu_rank}": self._telemetry_local_swap_out_bytes,
+            f"local_swap_in_bytes_gpu_{self._gpu_rank}": self._telemetry_local_swap_in_bytes,
+            f"remote_swap_out_bytes_gpu_{self._gpu_rank}": self._telemetry_remote_swap_out_bytes,
+            f"remote_swap_in_bytes_gpu_{self._gpu_rank}": self._telemetry_remote_swap_in_bytes,
+            f"num_remote_fallbacks_gpu_{self._gpu_rank}": self._telemetry_num_remote_fallbacks,
         }
 
     def take_telemetry_stats(self) -> dict[str, int]:
@@ -229,10 +370,251 @@ class SimpleCPUOffloadScheduler:
         self._telemetry_load_blocks = 0
         self._telemetry_store_bytes = 0
         self._telemetry_load_bytes = 0
+        self._telemetry_store_events_ge_16_blocks = 0
+        self._telemetry_store_events_lt_4_blocks = 0
+        self._telemetry_load_events_ge_16_blocks = 0
+        self._telemetry_load_events_lt_4_blocks = 0
+        self._telemetry_local_swap_out_bytes = 0
+        self._telemetry_local_swap_in_bytes = 0
+        self._telemetry_remote_swap_out_bytes = 0
+        self._telemetry_remote_swap_in_bytes = 0
+        self._telemetry_num_remote_fallbacks = 0
+        self._telemetry_swap_out_time_ms = 0.0
+        self._telemetry_swap_in_time_ms = 0.0
+        self._telemetry_local_swap_out_time_ms = 0.0
+        self._telemetry_local_swap_in_time_ms = 0.0
+        self._telemetry_remote_swap_out_time_ms = 0.0
+        self._telemetry_remote_swap_in_time_ms = 0.0
         return stats
+
+    def _assign_cpu_block_localities(
+        self,
+        cpu_block_ids: list[int],
+        *,
+        source_gpu_rank: int,
+        req_id: str,
+    ) -> list[str]:
+        labels = self._locality_planner.labels_for_block_ids(
+            cpu_block_ids,
+            source_gpu_rank=source_gpu_rank,
+        )
+        remote_fallbacks = sum(1 for label in labels if label == "remote")
+        if remote_fallbacks:
+            self._telemetry_num_remote_fallbacks += remote_fallbacks
+            logger.warning(
+                "GH200 remote fallback req_id=%s gpu_rank=%d reason=local_pool_exhausted remote_blocks=%d",
+                req_id,
+                source_gpu_rank,
+                remote_fallbacks,
+            )
+        return labels
+
+    @staticmethod
+    def _count_local_remote_bytes(labels: list[str], bytes_per_block: int) -> tuple[int, int]:
+        if not labels or bytes_per_block <= 0:
+            return 0, 0
+        local_blocks = sum(1 for label in labels if label == "local")
+        remote_blocks = len(labels) - local_blocks
+        return local_blocks * bytes_per_block, remote_blocks * bytes_per_block
+
+    def _estimate_request_remote_penalty_seconds(self, request: "Request") -> float:
+        if not self._gh200_topology_tuned:
+            return 0.0
+        unsynced_blocks = self._estimate_request_unsynced_swap_blocks_for_locality(request)
+        if unsynced_blocks <= 0:
+            return 0.0
+        remote_blocks = self._locality_planner.estimate_remote_blocks_for_gpu(
+            source_gpu_rank=self._gpu_rank,
+            num_blocks=unsynced_blocks,
+        )
+        if remote_blocks <= 0:
+            return 0.0
+        labels = ["local"] * max(unsynced_blocks - remote_blocks, 0)
+        labels.extend(["remote"] * remote_blocks)
+        _, remote_bytes = self._count_local_remote_bytes(
+            labels,
+            self._count_transfer_bytes(1),
+        )
+        return estimate_remote_penalty_seconds(
+            remote_bytes,
+            local_bandwidth_bytes_per_s=self._local_bw_bytes_per_s,
+            remote_bandwidth_bytes_per_s=self._remote_bw_bytes_per_s,
+        )
+
+    def estimate_request_remote_penalty_seconds(self, request: "Request") -> float:
+        return self._estimate_request_remote_penalty_seconds(request)
+
+    def _estimate_request_unsynced_swap_blocks_for_locality(self, request: "Request") -> int:
+        request_id = request.request_id
+        if request_id not in self._reqs_to_store:
+            return 0
+        state = self._reqs_to_store[request_id]
+        total_blocks = sum(len(group) for group in state.block_ids)
+        resident = self.get_num_cpu_resident_owned_blocks(request)
+        return max(total_blocks - resident, 0)
+
+    def _build_cpu_block_island_map(self) -> dict[int, int]:
+        islands = self._locality_planner.island_ids
+        if not islands:
+            return {}
+        allocatable_ids = [
+            blk.block_id for blk in self.cpu_block_pool.blocks if not blk.is_null
+        ]
+        if not allocatable_ids:
+            return {}
+        per_island = len(allocatable_ids) // len(islands)
+        extra = len(allocatable_ids) % len(islands)
+        mapping: dict[int, int] = {}
+        cursor = 0
+        for i, island in enumerate(islands):
+            count = per_island + (1 if i < extra else 0)
+            for block_id in allocatable_ids[cursor : cursor + count]:
+                mapping[block_id] = island
+            cursor += count
+        return mapping
+
+    def _choose_cpu_blocks_for_localities(self, labels: list[str]) -> list[int]:
+        if not labels:
+            return []
+
+        source_island = self._locality_planner.island_for_gpu_rank(self._gpu_rank)
+        free_blocks = self.cpu_block_pool.free_block_queue.get_all_free_blocks()
+        local_candidates = [
+            blk.block_id
+            for blk in free_blocks
+            if self._cpu_block_island_map.get(blk.block_id, source_island) == source_island
+        ]
+        remote_candidates = [
+            blk.block_id
+            for blk in free_blocks
+            if self._cpu_block_island_map.get(blk.block_id, source_island) != source_island
+        ]
+
+        selected: list[int] = []
+        for label in labels:
+            if label == "local":
+                if local_candidates:
+                    selected.append(local_candidates.pop(0))
+                    continue
+                if remote_candidates:
+                    selected.append(remote_candidates.pop(0))
+                    continue
+            else:
+                if remote_candidates:
+                    selected.append(remote_candidates.pop(0))
+                    continue
+                if local_candidates:
+                    selected.append(local_candidates.pop(0))
+                    continue
+            break
+
+        if len(selected) != len(labels):
+            # Should not happen if caller checks free block count. Fallback to deterministic
+            # head allocation for safety and keep behavior fail-open.
+            needed = len(labels)
+            return [blk.block_id for blk in free_blocks[:needed]]
+
+        return selected
+
+    def _allocate_cpu_blocks_locality_aware(
+        self,
+        *,
+        num_blocks: int,
+        req_id: str,
+    ) -> tuple[list["KVCacheBlock"], list[str], int]:
+        if num_blocks <= 0:
+            return [], [], 0
+
+        labels = self._locality_planner.plan_labels_for_allocation(
+            num_blocks=num_blocks,
+            source_gpu_rank=self._gpu_rank,
+        )
+        selected_ids = self._choose_cpu_blocks_for_localities(labels)
+        cpu_blocks = [self.cpu_block_pool.blocks[block_id] for block_id in selected_ids]
+
+        for block in cpu_blocks:
+            if block.ref_cnt == 0 and not block.is_null:
+                self.cpu_block_pool.free_block_queue.remove(block)
+            if self.cpu_block_pool.enable_caching:
+                self.cpu_block_pool._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            if self.cpu_block_pool.metrics_collector:
+                self.cpu_block_pool.metrics_collector.on_block_allocated(block)
+
+        remote_fallbacks = self._locality_planner.record_block_assignments(
+            selected_ids,
+            labels=labels,
+            source_gpu_rank=self._gpu_rank,
+            req_id=req_id,
+        )
+        if remote_fallbacks:
+            self._telemetry_num_remote_fallbacks += remote_fallbacks
+            logger.warning(
+                "GH200 remote fallback req_id=%s gpu_rank=%d reason=local_pool_exhausted remote_blocks=%d",
+                req_id,
+                self._gpu_rank,
+                remote_fallbacks,
+            )
+        return cpu_blocks, labels, remote_fallbacks
 
     def get_estimated_swap_bandwidth_bytes_per_s(self) -> float | None:
         return self._estimated_swap_bandwidth_bytes_per_s
+
+    def get_num_free_cpu_blocks(self) -> int:
+        return self.cpu_block_pool.get_num_free_blocks()
+
+    def get_num_total_cpu_blocks(self) -> int:
+        return self.num_cpu_blocks
+
+    def get_num_cpu_resident_blocks(self, request: "Request") -> int:
+        """Return consecutive full request blocks already resident on CPU.
+
+        This is a scheduler-facing estimate for SuperInfer-style synced block
+        residency. It intentionally uses the existing CPU prefix-cache lookup so
+        DeepSeek-V4 stays layout-opaque and safe under the current gpu-derived
+        copy path.
+        """
+        if not request.block_hashes:
+            return 0
+        max_hit_len = max(request.num_tokens - 1, 0)
+        if max_hit_len <= 0:
+            return 0
+
+        cpu_hit_blocks, hit_length = self.cpu_coordinator.find_longest_cache_hit(
+            request.block_hashes,
+            max_hit_len,
+        )
+        if hit_length <= 0:
+            return 0
+        return sum(
+            1 for group in cpu_hit_blocks for block in group if not block.is_null
+        )
+
+    def get_num_cpu_resident_owned_blocks(self, request: "Request") -> int:
+        """Return count of CPU-resident full blocks owned by this request.
+
+        A block is considered owned by the request iff its current GPU block
+        refcount is 1. Shared-prefix blocks (refcount > 1) are excluded.
+        """
+        store_state = self._reqs_to_store.get(request.request_id)
+        if store_state is None or self._gpu_block_pool is None:
+            return 0
+
+        cached = self.cpu_block_pool.cached_block_hash_to_block
+        owned_resident = 0
+        for group_ids in store_state.block_ids:
+            for gpu_block_id in group_ids:
+                gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
+                bhash = gpu_block.block_hash
+                if gpu_block.is_null or bhash is None:
+                    continue
+                if gpu_block.ref_cnt > 1:
+                    continue
+                if cached.get_one_block(bhash) is not None:
+                    owned_resident += 1
+
+        return owned_resident
 
     def _update_estimated_swap_bandwidth(
         self, bytes_to_copy: int, elapsed_s: float
@@ -331,6 +713,22 @@ class SimpleCPUOffloadScheduler:
         max_hit_len = request.num_tokens - 1 - num_computed_tokens
         if max_hit_len <= 0:
             return 0, False
+
+        if request.rotary_state in (
+            RequestRotaryState.ROTARY_SWAPPED,
+            RequestRotaryState.ROTARY_PENDING_IN,
+        ):
+            synced_cap = max(int(request.rotary_synced_blocks), 0) * self.block_size
+            max_hit_len = min(max_hit_len, synced_cap)
+
+            dirty_tail = max(int(request.rotary_dirty_tail_tokens), 0)
+            if dirty_tail > 0:
+                clean_limit = max(request.num_tokens - dirty_tail - num_computed_tokens, 0)
+                max_hit_len = min(max_hit_len, clean_limit)
+
+            if max_hit_len <= 0:
+                return 0, False
+
         _, hit_length = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
@@ -351,15 +749,22 @@ class SimpleCPUOffloadScheduler:
         block_ids_by_group = blocks.get_block_ids()
         num_groups = len(block_ids_by_group)
 
-        # Store tracking (eager mode only). Register the request;
-        # block IDs are accumulated from scheduler_output in
-        # _prepare_eager_store_specs via yield_req_data.
-        if not self._lazy_mode and req_id not in self._reqs_to_store:
-            self._reqs_to_store[req_id] = StoreRequestState(
-                request=request,
-                block_ids=tuple([] for _ in range(num_groups)),
-                num_stored_blocks=[0] * num_groups,
-            )
+        # Store tracking.  In eager mode this is the main store path.  In lazy
+        # mode it opportunistically stores confirmed full blocks while the
+        # request is still running, so later preemption can reuse CPU-resident
+        # synced blocks instead of copying everything at the point of eviction.
+        should_track_store = (
+            not self._lazy_mode
+            or req_id in self._reqs_to_store
+            or self._is_lazy_store_pressure_active()
+        )
+        if req_id not in self._reqs_to_store:
+            if should_track_store:
+                self._reqs_to_store[req_id] = StoreRequestState(
+                    request=request,
+                    block_ids=tuple([] for _ in range(num_groups)),
+                    num_stored_blocks=[0] * num_groups,
+                )
 
         if num_external_tokens == 0:
             return
@@ -421,7 +826,12 @@ class SimpleCPUOffloadScheduler:
 
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
-            request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
+            request=request,
+            transfer_meta=TransferMeta(
+                gpu_block_ids,
+                cpu_block_ids,
+                source_gpu_rank=self._gpu_rank,
+            ),
         )
 
     def build_connector_meta(
@@ -435,9 +845,18 @@ class SimpleCPUOffloadScheduler:
             store_event = self._store_event_counter
             self._store_event_counter += 1
             store_bytes = self._count_transfer_bytes(len(store_gpu))
-            self._store_event_to_blocks[store_event] = TransferMeta(
-                store_gpu, store_cpu
+            store_localities = self._locality_planner.labels_for_block_ids(
+                store_cpu,
+                source_gpu_rank=self._gpu_rank,
             )
+            self._store_event_to_blocks[store_event] = TransferMeta(
+                store_gpu,
+                store_cpu,
+                store_localities,
+                source_gpu_rank=self._gpu_rank,
+            )
+            self._pending_request_ids_by_store_event[store_event] = list(store_req_ids)
+            self._store_event_localities[store_event] = store_localities
             self._store_event_perf[store_event] = TransferPerfState(
                 started_at_s=time.monotonic(),
                 bytes_to_copy=store_bytes,
@@ -445,7 +864,11 @@ class SimpleCPUOffloadScheduler:
             self._telemetry_store_events += 1
             self._telemetry_store_blocks += len(store_gpu)
             self._telemetry_store_bytes += store_bytes
-            if store_req_ids:  # For eager mode only, track req->blocks mapping
+            if len(store_gpu) >= 16:
+                self._telemetry_store_events_ge_16_blocks += 1
+            if 0 < len(store_gpu) < 4:
+                self._telemetry_store_events_lt_4_blocks += 1
+            if store_req_ids:
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
                     store_state = self._reqs_to_store.get(req_id)
@@ -474,9 +897,16 @@ class SimpleCPUOffloadScheduler:
             load_event = self._load_event_counter
             self._load_event_counter += 1
             load_bytes = self._count_transfer_bytes(len(load_gpu))
+            load_localities = self._assign_cpu_block_localities(
+                load_cpu,
+                source_gpu_rank=self._gpu_rank,
+                req_id=",".join(load_req_ids),
+            )
             for req_id in load_req_ids:
                 self._reqs_to_load[req_id].load_event = load_event
             self._load_event_to_reqs[load_event] = load_req_ids
+            self._pending_request_ids_by_load_event[load_event] = list(load_req_ids)
+            self._load_event_localities[load_event] = load_localities
             self._load_event_perf[load_event] = TransferPerfState(
                 started_at_s=time.monotonic(),
                 bytes_to_copy=load_bytes,
@@ -484,16 +914,24 @@ class SimpleCPUOffloadScheduler:
             self._telemetry_load_events += 1
             self._telemetry_load_blocks += len(load_gpu)
             self._telemetry_load_bytes += load_bytes
+            if len(load_gpu) >= 16:
+                self._telemetry_load_events_ge_16_blocks += 1
+            if 0 < len(load_gpu) < 4:
+                self._telemetry_load_events_lt_4_blocks += 1
 
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
             load_event_to_reqs=self._load_event_to_reqs,
+            load_cpu_block_localities=self._load_event_localities,
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
+            store_cpu_block_localities=store_localities if store_gpu else [],
             need_flush=bool(scheduler_output.preempted_req_ids),
+            pin_memory_fix=self._pin_memory_fix,
+            swapper_block_first=self._swapper_block_first,
         )
         return result
 
@@ -502,12 +940,63 @@ class SimpleCPUOffloadScheduler:
     ) -> tuple[list[int], list[int], list[str]]:
         """Prepare store specs for the store event."""
         if self._lazy_mode:
-            return self._prepare_lazy_store_specs()
-        else:
-            return self._prepare_eager_store_specs(scheduler_output)
+            # Throughput-first policy: avoid stacking new D2H work while prior
+            # load/store transfers are still in flight.
+            if self.has_pending_transfers():
+                self._cleanup_finished_store_requests_without_pending_events()
+                return [], [], []
+            if not self._has_lazy_store_pressure(scheduler_output):
+                self._cleanup_finished_store_requests_without_pending_events()
+                return [], [], []
+            synced_gpu, synced_cpu, synced_req_ids = self._prepare_eager_store_specs(
+                scheduler_output
+            )
+            if self._debug_single_request_swap and synced_gpu:
+                return synced_gpu, synced_cpu, synced_req_ids
+            gpu_pool = self._gpu_block_pool
+            force_small_batch = bool(scheduler_output.preempted_req_ids)
+            if gpu_pool is not None and self._target_free > 0:
+                force_small_batch = force_small_batch or (
+                    gpu_pool.get_num_free_blocks() <= self._target_free
+                )
+            lazy_gpu, lazy_cpu, _ = self._prepare_lazy_store_specs(
+                force_small_batch=force_small_batch
+            )
+            return synced_gpu + lazy_gpu, synced_cpu + lazy_cpu, synced_req_ids
+
+        return self._prepare_eager_store_specs(scheduler_output)
+
+    def _has_lazy_store_pressure(self, scheduler_output: SchedulerOutput) -> bool:
+        """Return whether lazy mode should prepare CPU store work this step."""
+        if scheduler_output.preempted_req_ids:
+            return True
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None or self._target_free <= 0:
+            return False
+
+        # Lazy offload is a pressure valve, not a steady-state tax. Keep a
+        # compact pre-store watermark so synced blocks can be prepared shortly
+        # before allocator pressure, while avoiding excessive steady D2H traffic.
+        prestore_target = self._target_free + 1
+        return gpu_pool.get_num_free_blocks() <= prestore_target
+
+    def _is_lazy_store_pressure_active(self) -> bool:
+        """Fast local pressure check for lazy-mode bookkeeping decisions."""
+        gpu_pool = self._gpu_block_pool
+        if gpu_pool is None or self._target_free <= 0:
+            return False
+        prestore_target = self._target_free + 1
+        return gpu_pool.get_num_free_blocks() <= prestore_target
+
+    def _cleanup_finished_store_requests_without_pending_events(self) -> None:
+        """Drop finished metadata in lazy mode when no store work is required."""
+        for req_id, state in list(self._reqs_to_store.items()):
+            if state.finished and not state.store_events:
+                self._cleanup_store_request(req_id)
 
     def _prepare_lazy_store_specs(
         self,
+        force_small_batch: bool = False,
     ) -> tuple[list[int], list[int], list[str]]:
         """Single-pass cursor walk: offload cached GPU blocks near eviction.
 
@@ -561,13 +1050,24 @@ class SimpleCPUOffloadScheduler:
 
         self._cursor = last_visited
 
+        min_batch = self._min_lazy_store_batch_blocks
+        if self._target_free <= 1:
+            # Keep tiny-budget behavior unchanged to avoid starving prestore
+            # under very tight headroom.
+            min_batch = 1
+        if not force_small_batch and len(gpu_ids) < min_batch:
+            return [], [], []
+
         if self._debug_single_request_swap and gpu_ids:
             gpu_ids = gpu_ids[:1]
             block_hashes = block_hashes[:1]
 
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
-            cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+            cpu_blocks, _, _ = self._allocate_cpu_blocks_locality_aware(
+                num_blocks=len(gpu_ids),
+                req_id="<lazy-scan>",
+            )
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
@@ -605,9 +1105,11 @@ class SimpleCPUOffloadScheduler:
         num_groups = len(kv_cache_groups)
         gpu_blocks_this_step: set[int] = set()
 
+        req_new_tokens: dict[str, int] = {}
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
+            req_new_tokens[req_id] = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             state = self._reqs_to_store.get(req_id)
-            if state is None or state.finished:
+            if state is None:
                 continue
 
             # Accumulate new block IDs.
@@ -619,8 +1121,15 @@ class SimpleCPUOffloadScheduler:
                     if new_block_id_groups[g] is not None:
                         state.block_ids[g].extend(new_block_id_groups[g])
 
-            num_new_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            if num_new_tokens == 0:
+        for req_id, state in list(self._reqs_to_store.items()):
+            if state.finished:
+                # Finished requests can still have confirmed full blocks that were
+                # not flushed in the same scheduler step they completed.
+                pass
+            elif req_new_tokens.get(req_id, 0) <= 0:
+                continue
+
+            if state.finished and state.store_events:
                 continue
 
             block_ids_by_group = state.block_ids
@@ -631,6 +1140,7 @@ class SimpleCPUOffloadScheduler:
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
             advanced_per_group: list[int] = [0] * num_groups
+            ready_per_group: list[int] = [0] * num_groups
             out_of_space = False
             # Confirmed tokens: KV data written and visible to all streams.
             req = state.request
@@ -646,11 +1156,21 @@ class SimpleCPUOffloadScheduler:
                 # Cap to blocks with confirmed KV data.
                 g_block_size = kv_cache_groups[g].kv_cache_spec.block_size
                 ready_blocks_g = confirmed_tokens // g_block_size
+                ready_per_group[g] = ready_blocks_g
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
                 for gpu_block_id in scannable:
                     gpu_block = gpu_block_pool.blocks[gpu_block_id]
                     if gpu_block.is_null:
+                        advanced_per_group[g] += 1
+                        continue
+
+                    # Shared-prefix block: keep it pinned/shared and avoid
+                    # request-local offload ownership assumptions.
+                    if (
+                        gpu_block.ref_cnt > 1
+                        and gpu_block_id not in state.finish_touched_gpu_block_ids
+                    ):
                         advanced_per_group[g] += 1
                         continue
 
@@ -685,7 +1205,10 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
             n_to_alloc = len(gpu_block_ids)
             if n_to_alloc > 0:
-                cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
+                cpu_blocks_alloc, _, _ = self._allocate_cpu_blocks_locality_aware(
+                    num_blocks=n_to_alloc,
+                    req_id=req_id,
+                )
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
@@ -717,6 +1240,16 @@ class SimpleCPUOffloadScheduler:
             for g in range(num_groups):
                 state.num_stored_blocks[g] += advanced_per_group[g]
 
+            if (
+                state.finished
+                and not state.store_events
+                and all(
+                    state.num_stored_blocks[g] >= ready_per_group[g]
+                    for g in range(num_groups)
+                )
+            ):
+                self._cleanup_store_request(req_id)
+
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -746,28 +1279,50 @@ class SimpleCPUOffloadScheduler:
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
         transfer = self._store_event_to_blocks.pop(event_idx)
+        self._pending_request_ids_by_store_event.pop(event_idx, [])
+        if transfer.cpu_block_ids:
+            self._locality_planner.release_block_ids(
+                transfer.cpu_block_ids,
+                source_gpu_rank=transfer.source_gpu_rank,
+            )
         self._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
         perf = self._store_event_perf.pop(event_idx, None)
+        store_localities = self._store_event_localities.pop(event_idx, [])
         if perf is not None:
+            elapsed_s = max(time.monotonic() - perf.started_at_s, 1e-9)
             self._update_estimated_swap_bandwidth(
                 perf.bytes_to_copy,
-                max(time.monotonic() - perf.started_at_s, 1e-9),
+                elapsed_s,
             )
+            elapsed_ms = elapsed_s * 1000.0
+            self._telemetry_swap_out_time_ms += elapsed_ms
+            bytes_per_block = self._count_transfer_bytes(1)
+            local_bytes, remote_bytes = self._count_local_remote_bytes(
+                store_localities,
+                bytes_per_block,
+            )
+            self._telemetry_local_swap_out_bytes += local_bytes
+            self._telemetry_remote_swap_out_bytes += remote_bytes
+            local_ms, remote_ms = split_elapsed_ms_by_bytes(
+                elapsed_ms,
+                local_bytes=local_bytes,
+                remote_bytes=remote_bytes,
+            )
+            self._telemetry_local_swap_out_time_ms += local_ms
+            self._telemetry_remote_swap_out_time_ms += remote_ms
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
             event_idx,
             len(transfer.cpu_block_ids),
         )
 
-        # Eager only: update per-req state
-        if not self._lazy_mode:
-            for req_id in self._store_event_to_reqs.pop(event_idx, []):
-                state = self._reqs_to_store.get(req_id)
-                if state is None:
-                    continue
-                state.store_events.discard(event_idx)
-                if state.finished and not state.store_events:
-                    self._cleanup_store_request(req_id)
+        for req_id in self._store_event_to_reqs.pop(event_idx, []):
+            state = self._reqs_to_store.get(req_id)
+            if state is None:
+                continue
+            state.store_events.discard(event_idx)
+            if state.finished and not state.store_events:
+                self._cleanup_store_request(req_id)
 
     def _process_store_completion(
         self, gpu_block_ids: list[int], cpu_block_ids: list[int]
@@ -798,6 +1353,16 @@ class SimpleCPUOffloadScheduler:
         """Return True if there are in-flight store transfers."""
         return bool(self._store_event_to_blocks)
 
+    def has_pending_transfers(self) -> bool:
+        """Return True if any load/store transfer is in-flight or pending."""
+        if self._store_event_to_blocks:
+            return True
+        if self._reqs_to_load:
+            return True
+        if self._load_event_to_reqs:
+            return True
+        return False
+
     def request_finished(
         self,
         request: "Request",
@@ -815,14 +1380,53 @@ class SimpleCPUOffloadScheduler:
             else:
                 self._cleanup_load_request(req_id)
 
-        # Handle store (eager mode only): defer cleanup if stores in-flight
-        if not self._lazy_mode:
-            store_state = self._reqs_to_store.get(req_id)
-            if store_state is not None:
-                if store_state.store_events:
-                    store_state.finished = True  # Defer: stores in-flight
-                else:
-                    self._cleanup_store_request(req_id)
+        # Handle per-request synced store tracking: defer cleanup if stores
+        # are still in flight.
+        store_state = self._reqs_to_store.get(req_id)
+        if store_state is None and block_ids:
+            if self._lazy_mode and not self._is_lazy_store_pressure_active():
+                return False, None
+            store_state = StoreRequestState(
+                request=request,
+                block_ids=(list(block_ids),),
+                num_stored_blocks=[0],
+            )
+            self._reqs_to_store[req_id] = store_state
+        elif store_state is not None and block_ids:
+            store_state.block_ids = (list(block_ids),)
+
+        if store_state is not None and self._gpu_block_pool is not None:
+            req = store_state.request
+            confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
+            gpu_ids_to_touch: list[int] = []
+            kv_groups = self.cpu_kv_cache_config.kv_cache_groups
+            for g, group_ids in enumerate(store_state.block_ids):
+                if g >= len(kv_groups):
+                    break
+                g_block_size = kv_groups[g].kv_cache_spec.block_size
+                ready_blocks_g = min(len(group_ids), confirmed_tokens // g_block_size)
+                start = min(store_state.num_stored_blocks[g], ready_blocks_g)
+                if start < ready_blocks_g:
+                    for bid in group_ids[start:ready_blocks_g]:
+                        block = self._gpu_block_pool.blocks[bid]
+                        if block.is_null or block.ref_cnt > 1:
+                            continue
+                        gpu_ids_to_touch.append(bid)
+            if gpu_ids_to_touch:
+                self._gpu_block_pool.touch(
+                    [
+                        self._gpu_block_pool.blocks[bid]
+                        for bid in gpu_ids_to_touch
+                        if not self._gpu_block_pool.blocks[bid].is_null
+                    ]
+                )
+                store_state.finish_touched_gpu_block_ids.update(gpu_ids_to_touch)
+
+        if store_state is not None:
+            if store_state.store_events:
+                store_state.finished = True
+            else:
+                store_state.finished = True
 
         return False, None
 
@@ -831,6 +1435,19 @@ class SimpleCPUOffloadScheduler:
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
+        req_id = request.request_id
+        if req_id not in self._reqs_to_store and block_ids:
+            self._reqs_to_store[req_id] = StoreRequestState(
+                request=request,
+                block_ids=tuple(list(group_ids) for group_ids in block_ids),
+                num_stored_blocks=[0] * len(block_ids),
+            )
+        elif req_id in self._reqs_to_store and block_ids:
+            state = self._reqs_to_store[req_id]
+            state.block_ids = tuple(list(group_ids) for group_ids in block_ids)
+            if len(state.num_stored_blocks) != len(state.block_ids):
+                state.num_stored_blocks = [0] * len(state.block_ids)
+
         return self.request_finished(request, block_ids=[])
 
     def _cleanup_load_request(self, req_id: str) -> None:
@@ -855,12 +1472,31 @@ class SimpleCPUOffloadScheduler:
                     completed_event_idx = state.load_event
 
         if completed_event_idx is not None:
+            _ = self._pending_request_ids_by_load_event.pop(completed_event_idx, [])
             perf = self._load_event_perf.pop(completed_event_idx, None)
+            load_localities = self._load_event_localities.pop(completed_event_idx, [])
             if perf is not None:
+                elapsed_s = max(time.monotonic() - perf.started_at_s, 1e-9)
                 self._update_estimated_swap_bandwidth(
                     perf.bytes_to_copy,
-                    max(time.monotonic() - perf.started_at_s, 1e-9),
+                    elapsed_s,
                 )
+                elapsed_ms = elapsed_s * 1000.0
+                self._telemetry_swap_in_time_ms += elapsed_ms
+                bytes_per_block = self._count_transfer_bytes(1)
+                local_bytes, remote_bytes = self._count_local_remote_bytes(
+                    load_localities,
+                    bytes_per_block,
+                )
+                self._telemetry_local_swap_in_bytes += local_bytes
+                self._telemetry_remote_swap_in_bytes += remote_bytes
+                local_ms, remote_ms = split_elapsed_ms_by_bytes(
+                    elapsed_ms,
+                    local_bytes=local_bytes,
+                    remote_bytes=remote_bytes,
+                )
+                self._telemetry_local_swap_in_time_ms += local_ms
+                self._telemetry_remote_swap_in_time_ms += remote_ms
 
         if state.transfer_meta is not None:
             # Free CPU touch refs

@@ -304,6 +304,43 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
+        wo_a_scale = getattr(self.wo_a, "weight_scale_inv", None)
+        if wo_a_scale is None:
+            wo_a_scale = getattr(self.wo_a, "weight_scale", None)
+
+        if wo_a_scale is None:
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            cos_sin = cos_sin_cache[positions].float()
+            half = self.rope_head_dim // 2
+            cos = cos_sin[:, :half].repeat_interleave(2, dim=-1).unsqueeze(1)
+            sin = -cos_sin[:, half:].repeat_interleave(2, dim=-1).unsqueeze(1)
+
+            o_pass = o[..., : self.nope_head_dim]
+            o_rot = o[..., self.nope_head_dim :].float()
+            o_rot_pair = torch.stack((-o_rot[..., 1::2], o_rot[..., ::2]), dim=-1)
+            o_rot_pair = o_rot_pair.reshape_as(o_rot)
+            o_unrope = torch.cat([o_pass, (o_rot * cos + o_rot_pair * sin).to(o.dtype)], dim=-1)
+
+            wo_a_input = o_unrope.flatten(1).view(num_tokens, self.n_local_groups, -1)
+            per_group_in = wo_a_input.shape[-1]
+            wo_a_weight = getattr(self.wo_a, "weight", None)
+            if (
+                wo_a_weight is not None
+                and wo_a_weight.dim() == 2
+                and wo_a_weight.shape[0] == self.n_local_groups * self.o_lora_rank
+                and wo_a_weight.shape[1] == per_group_in
+            ):
+                grouped_weight = wo_a_weight.view(
+                    self.n_local_groups, self.o_lora_rank, per_group_in
+                )
+                z = torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
+                return self.wo_b(z.flatten(1))
+
+            z = self.wo_a(wo_a_input)
+            if isinstance(z, tuple):
+                z = z[0]
+            return self.wo_b(z.flatten(1))
+
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
             o,
@@ -317,8 +354,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         wo_a_fp8 = self.wo_a.weight
-        wo_a_scale = self.wo_a.weight_scale_inv
-
         z = torch.empty(
             (num_tokens, self.n_local_groups, self.o_lora_rank),
             device=o.device,

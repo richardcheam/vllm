@@ -685,19 +685,28 @@ class VllmConfig:
             # Route SuperInfer CPU swap budget through the simple offload
             # connector so allocator capacity is enforced by cpu_bytes_to_use.
             self.kv_transfer_config.kv_connector = "SimpleCPUOffloadConnector"
-            self.kv_transfer_config.kv_connector_extra_config.update(
+            extra_config = self.kv_transfer_config.kv_connector_extra_config
+            extra_config.update(
                 {
                     "cpu_bytes_to_use": self.cache_config.swap_cpu_memory_gb * (1 << 30),
                     # SuperInfer mode assumes scheduler-side autonomous
                     # scanning/offload decisions.
                     "lazy_offload": True,
-                    # Step-6 debug guard: force minimal single-request transfer
-                    # granularity while validating swap correctness.
-                    "debug_single_request_swap": bool(
-                        self.scheduler_config.proactive_swap_budget > 0
-                    ),
+                    "pin_memory_fix": self.cache_config.pin_memory_fix,
+                    "swapper_block_first": self.cache_config.swapper_block_first,
+                    "superinfer_high_risk_mode": self.cache_config.superinfer_high_risk_mode,
+                    "gh200_topology_tuned": self.cache_config.gh200_topology_tuned,
+                    "local_cpu_pool_fraction": self.cache_config.local_cpu_pool_fraction,
+                    "local_swap_bandwidth_bytes_per_s": self.cache_config.local_swap_bandwidth_bytes_per_s,
+                    "remote_swap_bandwidth_bytes_per_s": self.cache_config.remote_swap_bandwidth_bytes_per_s,
                 }
             )
+            # Keep the debug throttle opt-in. The guarded proactive path now
+            # supports budgeted multi-victim movement by default.
+            extra_config.setdefault("debug_single_request_swap", False)
+            # Throughput-oriented default: avoid tiny lazy store batches unless
+            # pressure is urgent.
+            extra_config.setdefault("min_lazy_store_batch_blocks", 2)
             self.kv_transfer_config.kv_role = "kv_both"
             logger.info(
                 "Enabling SimpleCPUOffloadConnector from --swap-cpu-memory-gb=%.3f GiB",

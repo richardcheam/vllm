@@ -57,6 +57,18 @@ class SimpleCPUOffloadConnectorStats(KVConnectorStats):
         "offload_store_bytes",
         "offload_load_bytes",
     )
+    _sum_keys: tuple[str, ...] = (
+        "offload_store_events",
+        "offload_load_events",
+        "offload_store_blocks",
+        "offload_load_blocks",
+        "offload_store_bytes",
+        "offload_load_bytes",
+        "offload_store_events_ge_16_blocks",
+        "offload_store_events_lt_4_blocks",
+        "offload_load_events_ge_16_blocks",
+        "offload_load_events_lt_4_blocks",
+    )
 
     def reset(self):
         self.data = {}
@@ -65,7 +77,13 @@ class SimpleCPUOffloadConnectorStats(KVConnectorStats):
         merged = dict(self.data)
         for key, value in other.data.items():
             if isinstance(value, (int, float)):
-                merged[key] = merged.get(key, 0) + value
+                if key in self._sum_keys:
+                    merged[key] = merged.get(key, 0) + value
+                else:
+                    # Pending counts, capacity gauges, config flags, and rolling
+                    # bandwidth estimates are point-in-time values. Keep the
+                    # latest sample instead of summing them across log intervals.
+                    merged[key] = value
             else:
                 merged[key] = value
         self.data = merged
@@ -118,6 +136,12 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         debug_single_request_swap = bool(
             extra_config.get("debug_single_request_swap", False)
         )
+        pin_memory_fix = bool(extra_config.get("pin_memory_fix", False))
+        swapper_block_first = bool(extra_config.get("swapper_block_first", False))
+        min_lazy_store_batch_blocks = int(
+            extra_config.get("min_lazy_store_batch_blocks", 1)
+        )
+        gh200_topology_tuned = bool(extra_config.get("gh200_topology_tuned", False))
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
@@ -131,13 +155,27 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
-            "per_rank=%.2f GB, world_size=%d, mode=%s, debug_single_request_swap=%s",
+            "per_rank=%.2f GB, world_size=%d, mode=%s, "
+            "debug_single_request_swap=%s, pin_memory_fix=%s, "
+            "swapper_block_first=%s, min_lazy_store_batch_blocks=%d",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
             "lazy" if lazy_offload else "eager",
             debug_single_request_swap,
+            pin_memory_fix,
+            swapper_block_first,
+            min_lazy_store_batch_blocks,
         )
+        if gh200_topology_tuned:
+            logger.info(
+                "SimpleCPUOffloadConnector: gh200_topology_tuned enabled (hardware-aware locality mode)"
+            )
+        if swapper_block_first:
+            logger.info(
+                "swapper_block_first requested: worker applies strict safety gates "
+                "and may fallback to gpu_derived layout when unsupported."
+            )
 
         if role == KVConnectorRole.SCHEDULER:
             self.scheduler_manager = SimpleCPUOffloadScheduler(
@@ -146,10 +184,17 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 cpu_capacity_per_rank,
                 lazy_offload=lazy_offload,
                 debug_single_request_swap=debug_single_request_swap,
+                pin_memory_fix=pin_memory_fix,
+                swapper_block_first=swapper_block_first,
+                min_lazy_store_batch_blocks=min_lazy_store_batch_blocks,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
-                vllm_config, kv_cache_config, cpu_capacity_per_rank
+                vllm_config,
+                kv_cache_config,
+                cpu_capacity_per_rank,
+                pin_memory_fix=pin_memory_fix,
+                swapper_block_first=swapper_block_first,
             )
 
     # --- Worker-side methods ---
@@ -275,7 +320,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # NOTE: New API only for SimpleCPUOffloadConnector.
     def has_pending_transfers(self) -> bool:
         if self.scheduler_manager is not None:
-            return self.scheduler_manager.has_pending_stores()
+            return self.scheduler_manager.has_pending_transfers()
         return False
 
     # NOTE: New API only for proactive VLT telemetry in Scheduler.
@@ -283,6 +328,31 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.scheduler_manager is not None:
             return self.scheduler_manager.get_estimated_swap_bandwidth_bytes_per_s()
         return None
+
+    def get_num_free_cpu_blocks(self) -> int | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_free_cpu_blocks()
+        return None
+
+    def get_num_total_cpu_blocks(self) -> int | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_total_cpu_blocks()
+        return None
+
+    def get_num_cpu_resident_blocks(self, request: "Request") -> int:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_cpu_resident_blocks(request)
+        return 0
+
+    def get_num_cpu_resident_owned_blocks(self, request: "Request") -> int:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_cpu_resident_owned_blocks(request)
+        return 0
+
+    def estimate_request_remote_penalty_seconds(self, request: "Request") -> float:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.estimate_request_remote_penalty_seconds(request)
+        return 0.0
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         if self.scheduler_manager is not None:

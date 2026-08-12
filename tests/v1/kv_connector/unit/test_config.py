@@ -18,10 +18,15 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.fixture(autouse=True)
 def force_cpu_platform(monkeypatch: pytest.MonkeyPatch):
+    import vllm.config.parallel as parallel_config
     import vllm.platforms as platforms
     from vllm.platforms.cpu import CpuPlatform
 
-    monkeypatch.setattr(platforms, "current_platform", CpuPlatform(), raising=False)
+    cpu_platform = CpuPlatform()
+    monkeypatch.setattr(platforms, "current_platform", cpu_platform, raising=False)
+    monkeypatch.setattr(
+        parallel_config, "current_platform", cpu_platform, raising=False
+    )
 
 
 @pytest.mark.parametrize(
@@ -130,6 +135,63 @@ def test_swap_cpu_memory_gb_enables_simple_offload_connector():
     )
     assert kv_transfer_config.kv_connector_extra_config["lazy_offload"] is True
     assert kv_transfer_config.kv_connector_extra_config["debug_single_request_swap"] is False
+    assert kv_transfer_config.kv_connector_extra_config["pin_memory_fix"] is False
+    assert kv_transfer_config.kv_connector_extra_config["swapper_block_first"] is False
+    assert kv_transfer_config.kv_connector_extra_config["superinfer_high_risk_mode"] is False
+
+
+def test_swap_cpu_memory_gb_propagates_superinfer_transfer_flags():
+    vllm_config = VllmConfig(
+        cache_config=CacheConfig(
+            swap_cpu_memory_gb=12.5,
+            pin_memory_fix=True,
+            swapper_block_first=True,
+        ),
+    )
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    assert kv_transfer_config is not None
+    assert kv_transfer_config.kv_connector == "SimpleCPUOffloadConnector"
+    assert kv_transfer_config.kv_connector_extra_config["pin_memory_fix"] is True
+    assert kv_transfer_config.kv_connector_extra_config["swapper_block_first"] is True
+
+
+def test_swap_cpu_memory_gb_propagates_high_risk_mode_flag():
+    vllm_config = VllmConfig(
+        cache_config=CacheConfig(
+            swap_cpu_memory_gb=12.5,
+            superinfer_high_risk_mode=True,
+        ),
+    )
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    assert kv_transfer_config is not None
+    assert kv_transfer_config.kv_connector_extra_config["superinfer_high_risk_mode"] is True
+
+
+def test_swap_cpu_memory_gb_propagates_gh200_topology_flags():
+    vllm_config = VllmConfig(
+        cache_config=CacheConfig(
+            swap_cpu_memory_gb=12.5,
+            gh200_topology_tuned=True,
+            local_cpu_pool_fraction=0.8,
+            local_swap_bandwidth_bytes_per_s=123.0,
+            remote_swap_bandwidth_bytes_per_s=45.0,
+        ),
+    )
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    assert kv_transfer_config is not None
+    assert kv_transfer_config.kv_connector_extra_config["gh200_topology_tuned"] is True
+    assert kv_transfer_config.kv_connector_extra_config["local_cpu_pool_fraction"] == 0.8
+    assert (
+        kv_transfer_config.kv_connector_extra_config["local_swap_bandwidth_bytes_per_s"]
+        == 123.0
+    )
+    assert (
+        kv_transfer_config.kv_connector_extra_config["remote_swap_bandwidth_bytes_per_s"]
+        == 45.0
+    )
 
 
 def test_swap_cpu_memory_gb_overrides_existing_connector_preserving_extra_config():
@@ -140,7 +202,10 @@ def test_swap_cpu_memory_gb_overrides_existing_connector_preserving_extra_config
         kv_transfer_config=KVTransferConfig(
             kv_connector="ExistingConnector",
             kv_role="kv_producer",
-            kv_connector_extra_config={"existing_key": "existing_value"},
+            kv_connector_extra_config={
+                "existing_key": "existing_value",
+                "debug_single_request_swap": True,
+            },
         ),
     )
 
@@ -155,9 +220,10 @@ def test_swap_cpu_memory_gb_overrides_existing_connector_preserving_extra_config
         2.0 * (1 << 30)
     )
     assert kv_transfer_config.kv_connector_extra_config["lazy_offload"] is True
+    assert kv_transfer_config.kv_connector_extra_config["debug_single_request_swap"] is True
 
 
-def test_swap_cpu_memory_gb_with_proactive_budget_enables_debug_single_request_swap():
+def test_swap_cpu_memory_gb_with_proactive_budget_keeps_batched_swaps_enabled():
     vllm_config = VllmConfig(
         cache_config=CacheConfig(
             swap_cpu_memory_gb=8.0,
@@ -172,7 +238,7 @@ def test_swap_cpu_memory_gb_with_proactive_budget_enables_debug_single_request_s
     kv_transfer_config = vllm_config.kv_transfer_config
     assert kv_transfer_config is not None
     assert kv_transfer_config.kv_connector == "SimpleCPUOffloadConnector"
-    assert kv_transfer_config.kv_connector_extra_config["debug_single_request_swap"] is True
+    assert kv_transfer_config.kv_connector_extra_config["debug_single_request_swap"] is False
 
 
 def test_swap_cpu_memory_gb_rejects_non_positive_values():

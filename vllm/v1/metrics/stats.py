@@ -180,7 +180,23 @@ class SchedulerStats:
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
     num_preempted_reqs: int = 0
 
+    num_rotary_preempted_reqs: int = 0
+    num_rotary_synced_blocks: int = 0
+    num_rotary_unsynced_blocks: int = 0
+    num_rotary_dirty_tail_tokens: int = 0
+    num_proactive_cooldown_skips: int = 0
+    num_proactive_low_gain_skips: int = 0
+    num_proactive_no_waiting_skips: int = 0
+    num_proactive_pending_transfer_skips: int = 0
+    num_proactive_already_free_skips: int = 0
+    num_proactive_cpu_capacity_skips: int = 0
+    num_proactive_no_candidate_rounds: int = 0
+    num_proactive_cpu_pressure_skips: int = 0
+    proactive_locality_penalty_ms: int = 0
+
     num_waiting_for_remote_kv_reqs: int = 0
+    num_remote_wait_entries: int = 0
+    num_remote_wait_promotions: int = 0
     num_waiting_for_structured_output_reqs: int = 0
     num_waiting_for_streaming_reqs: int = 0
     num_pending_kv_transfer_reqs: int = 0

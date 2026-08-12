@@ -17,6 +17,9 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (
+    SimpleCPUOffloadConnectorStats,
+)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -37,7 +40,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 from vllm.v1.outputs import KVConnectorOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestRotaryState
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
 from vllm.v1.simple_kv_offload.metadata import SimpleCPUOffloadWorkerMetadata
 
@@ -97,6 +100,9 @@ def _make_kv_cache_config(
 def _make_vllm_config(
     block_size: int = BLOCK_SIZE,
     proactive_swap_budget: int = 0,
+    min_lazy_store_batch_blocks: int = 1,
+    gh200_topology_tuned: bool = False,
+    local_cpu_pool_fraction: float = 0.75,
 ) -> VllmConfig:
     """Minimal VllmConfig for scheduler tests (no GPU)."""
     model_config = ModelConfig(
@@ -117,10 +123,15 @@ def _make_vllm_config(
         block_size=block_size,
         gpu_memory_utilization=0.9,
         enable_prefix_caching=True,
+        gh200_topology_tuned=gh200_topology_tuned,
+        local_cpu_pool_fraction=local_cpu_pool_fraction,
     )
     kv_transfer_config = KVTransferConfig(
         kv_connector="SimpleCPUOffloadConnector",
         kv_role="kv_both",
+        kv_connector_extra_config={
+            "min_lazy_store_batch_blocks": min_lazy_store_batch_blocks,
+        },
     )
     return VllmConfig(
         scheduler_config=scheduler_config,
@@ -148,12 +159,20 @@ def make_scheduler(
     num_groups: int = 1,
     lazy: bool = False,
     debug_single_request_swap: bool = False,
+    pin_memory_fix: bool = False,
+    swapper_block_first: bool = False,
     proactive_swap_budget: int = 0,
+    min_lazy_store_batch_blocks: int = 1,
+    gh200_topology_tuned: bool = False,
+    local_cpu_pool_fraction: float = 0.75,
 ) -> SchedulerFixture:
     """Build a SimpleCPUOffloadScheduler with small block pools."""
     kv_cache_config = _make_kv_cache_config(num_gpu_blocks, num_groups)
     vllm_config = _make_vllm_config(
         proactive_swap_budget=proactive_swap_budget,
+        min_lazy_store_batch_blocks=min_lazy_store_batch_blocks,
+        gh200_topology_tuned=gh200_topology_tuned,
+        local_cpu_pool_fraction=local_cpu_pool_fraction,
     )
     cpu_capacity_bytes = _BYTES_PER_BLOCK * num_cpu_blocks * num_groups
 
@@ -163,6 +182,9 @@ def make_scheduler(
         cpu_capacity_bytes=cpu_capacity_bytes,
         lazy_offload=lazy,
         debug_single_request_swap=debug_single_request_swap,
+        pin_memory_fix=pin_memory_fix,
+        swapper_block_first=swapper_block_first,
+        min_lazy_store_batch_blocks=min_lazy_store_batch_blocks,
     )
 
     # Build a real GPU block pool and bind it
@@ -439,6 +461,187 @@ def test_simple_offload_telemetry_stats_roundtrip() -> None:
     assert reset_stats["offload_store_bytes"] == 0
 
 
+def test_simple_offload_reports_superinfer_static_flags() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=True,
+        pin_memory_fix=True,
+        swapper_block_first=True,
+    )
+    sched = fix.scheduler
+
+    stats = sched.telemetry_stats
+    assert stats["offload_pin_memory_fix"] == 1
+    assert stats["offload_swapper_block_first"] == 1
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.pin_memory_fix is True
+    assert meta.swapper_block_first is True
+
+
+def test_simple_offload_reports_gh200_topology_telemetry_keys() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=True,
+    )
+    sched = fix.scheduler
+
+    stats = sched.telemetry_stats
+    assert "local_swap_out_bytes" in stats
+    assert "local_swap_in_bytes" in stats
+    assert "remote_swap_out_bytes" in stats
+    assert "remote_swap_in_bytes" in stats
+    assert "num_remote_fallbacks" in stats
+    assert "swap_out_time_ms" in stats
+    assert "swap_in_time_ms" in stats
+    assert "local_bandwidth_gbps" in stats
+    assert "remote_bandwidth_gbps" in stats
+    assert "offload_gh200_topology_discovered" in stats
+    assert "offload_gh200_topology_fallback_mode" in stats
+
+
+def test_gh200_topology_store_locality_uses_cpu_pool_split() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=False,
+        gh200_topology_tuned=True,
+        local_cpu_pool_fraction=0.5,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=4)
+    kv_blocks = _alloc_and_register(fix, req, 4)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: 4 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    meta = sched.build_connector_meta(sched_out)
+
+    assert meta.store_event >= 0
+    expected_localities_1 = sched._locality_planner.labels_for_block_ids(
+        meta.store_cpu_blocks,
+        source_gpu_rank=sched._gpu_rank,
+    )
+    assert meta.store_cpu_block_localities == expected_localities_1
+
+    # Force next store event past local pool capacity to verify remote mapping.
+    req2 = make_request(num_blocks=4)
+    kv_blocks2 = _alloc_and_register(fix, req2, 4)
+    sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=0)
+    sched_out2 = make_scheduler_output(
+        {req2.request_id: 4 * BLOCK_SIZE},
+        new_reqs={req2.request_id: kv_blocks2.get_block_ids()},
+    )
+    meta2 = sched.build_connector_meta(sched_out2)
+
+    assert meta2.store_event >= 0
+    expected_localities_2 = sched._locality_planner.labels_for_block_ids(
+        meta2.store_cpu_blocks,
+        source_gpu_rank=sched._gpu_rank,
+    )
+    assert meta2.store_cpu_block_localities == expected_localities_2
+
+    simulate_store_completion(sched, meta.store_event)
+    simulate_store_completion(sched, meta2.store_event)
+
+    stats = sched.telemetry_stats
+    expected_remote_blocks = expected_localities_1.count("remote") + expected_localities_2.count(
+        "remote"
+    )
+    expected_local_blocks = expected_localities_1.count("local") + expected_localities_2.count(
+        "local"
+    )
+    assert stats["num_remote_fallbacks"] == expected_remote_blocks
+    assert stats["local_swap_out_bytes"] == expected_local_blocks * _BYTES_PER_BLOCK
+    assert stats["remote_swap_out_bytes"] == expected_remote_blocks * _BYTES_PER_BLOCK
+
+
+def test_gh200_topology_prefers_local_island_cpu_block_ids() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=False,
+        gh200_topology_tuned=True,
+        local_cpu_pool_fraction=1.0,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: 2 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    meta = sched.build_connector_meta(sched_out)
+
+    assert meta.store_event >= 0
+    assert meta.store_cpu_block_localities == ["local", "local"]
+    source_island = sched._locality_planner.island_for_gpu_rank(sched._gpu_rank)
+    for block_id in meta.store_cpu_blocks:
+        assert sched._cpu_block_island_map.get(block_id) == source_island
+
+
+def test_non_topology_store_locality_stays_local() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=False,
+        gh200_topology_tuned=False,
+        local_cpu_pool_fraction=0.1,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=4)
+    kv_blocks = _alloc_and_register(fix, req, 4)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: 4 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+    meta = sched.build_connector_meta(sched_out)
+
+    assert meta.store_event >= 0
+    assert meta.store_cpu_block_localities == ["local"] * 4
+    assert sched.telemetry_stats["num_remote_fallbacks"] == 0
+
+
+def test_simple_offload_stats_aggregate_keeps_gauges_latest() -> None:
+    stats = SimpleCPUOffloadConnectorStats(
+        data={
+            "offload_store_events": 1,
+            "offload_store_blocks": 2,
+            "offload_store_bytes": 100,
+            "offload_pending_store_events": 3,
+            "offload_cpu_total_blocks": 8,
+            "offload_pin_memory_fix": 1,
+        }
+    )
+    other = SimpleCPUOffloadConnectorStats(
+        data={
+            "offload_store_events": 4,
+            "offload_store_blocks": 5,
+            "offload_store_bytes": 200,
+            "offload_pending_store_events": 1,
+            "offload_cpu_total_blocks": 8,
+            "offload_pin_memory_fix": 1,
+        }
+    )
+
+    merged = stats.aggregate(other).reduce()
+
+    assert merged["offload_store_events"] == 5
+    assert merged["offload_store_blocks"] == 7
+    assert merged["offload_store_bytes"] == 300
+    assert merged["offload_pending_store_events"] == 1
+    assert merged["offload_cpu_total_blocks"] == 8
+    assert merged["offload_pin_memory_fix"] == 1
+
+
 def test_simple_offload_estimated_swap_bandwidth_updates() -> None:
     fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
     sched = fix.scheduler
@@ -493,6 +696,19 @@ def test_simple_offload_estimated_swap_bandwidth_updates() -> None:
 
     stats = sched.telemetry_stats
     assert stats["offload_estimated_swap_bandwidth_bytes_per_s"] > 0
+
+
+def test_simple_offload_reports_free_cpu_blocks() -> None:
+    fix = make_scheduler(num_cpu_blocks=4, num_gpu_blocks=8, lazy=True)
+    sched = fix.scheduler
+
+    initial_free = sched.get_num_free_cpu_blocks()
+    assert initial_free == 3
+    allocated = sched.cpu_block_pool.get_new_blocks(2)
+    assert sched.get_num_free_cpu_blocks() == initial_free - 2
+
+    sched.cpu_block_pool.free_blocks(allocated)
+    assert sched.get_num_free_cpu_blocks() == initial_free
 
 
 def test_debug_single_request_swap_limits_store_and_load_to_one_request() -> None:
@@ -685,6 +901,130 @@ def test_lazy_proactive_swap_budget_overrides_scan_depth() -> None:
 
     simulate_store_completion(sched, meta.store_event)
     gpu_pool.free_blocks(fillers)
+
+
+def test_lazy_store_skips_when_gpu_free_blocks_above_pressure_target() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched_out = make_scheduler_output(
+        {req.request_id: 2 * BLOCK_SIZE},
+        new_reqs={req.request_id: kv_blocks.get_block_ids()},
+    )
+
+    assert fix.gpu_block_pool.get_num_free_blocks() > 4
+    meta = sched.build_connector_meta(sched_out)
+
+    assert meta.store_event < 0
+    assert meta.store_gpu_blocks == []
+    assert meta.store_cpu_blocks == []
+
+
+def test_lazy_update_state_skips_store_registration_without_pressure() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    assert req.request_id not in sched._reqs_to_store
+
+    # Force low free-block pressure and repeat update; now tracking activates.
+    _ = fix.gpu_block_pool.get_new_blocks(3)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    assert req.request_id in sched._reqs_to_store
+
+
+def test_lazy_proactive_swap_budget_batches_by_default() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=2)
+    gpu_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    gpu_pool.free_blocks(gpu_blocks)
+
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 2
+    assert len(meta.store_cpu_blocks) == 2
+
+    simulate_store_completion(sched, meta.store_event)
+    gpu_pool.free_blocks(fillers)
+
+
+def test_lazy_debug_single_request_swap_still_limits_proactive_budget() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+        debug_single_request_swap=True,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=2)
+    gpu_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    gpu_pool.free_blocks(gpu_blocks)
+
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 1
+    assert len(meta.store_cpu_blocks) == 1
+
+    simulate_store_completion(sched, meta.store_event)
+    gpu_pool.free_blocks(fillers)
+
+
+def test_lazy_small_batches_deferred_until_min_batch_threshold() -> None:
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+        min_lazy_store_batch_blocks=3,
+    )
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=2)
+    gpu_blocks = _allocate_gpu_blocks(gpu_pool, req, 2, group_id=0)
+    gpu_pool.free_blocks(gpu_blocks)
+
+    fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
+    lazy_gpu, lazy_cpu, _ = sched._prepare_lazy_store_specs(force_small_batch=False)
+
+    assert lazy_gpu == []
+    assert lazy_cpu == []
+    stats = sched.telemetry_stats
+    assert stats["offload_min_lazy_store_batch_blocks"] == 3
+
+
+def test_total_cpu_blocks_accessor() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=True)
+    sched = fix.scheduler
+    assert sched.get_num_total_cpu_blocks() == 8
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1577,131 @@ def test_chunked_prefill_reads_live_block_ids() -> None:
     assert len(meta2.store_gpu_blocks) == 2
 
 
+def test_request_finished_does_not_flush_without_lazy_pressure() -> None:
+    """Lazy mode avoids finish-time flush when GPU has ample free blocks."""
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=16,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    before_free = get_cpu_free_blocks(sched)
+    sched.request_finished(req, block_ids=kv_blocks.get_block_ids()[0])
+
+    sched_out = make_scheduler_output({})
+    meta = sched.build_connector_meta(sched_out)
+    assert meta.store_event < 0
+    assert len(meta.store_gpu_blocks) == 0
+    assert get_cpu_free_blocks(sched) == before_free
+    assert req.request_id not in sched._reqs_to_store
+
+    req2 = Request(
+        request_id="req-finish-flush-hit",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens == 0
+    assert is_async is False
+
+
+def test_request_finished_flushes_confirmed_store_blocks_under_pressure() -> None:
+    """Lazy mode keeps finish-time flush behavior once free-block pressure starts."""
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    # Keep free blocks at/below prestore watermark (target=2 => watermark=4).
+    fillers = fix.gpu_block_pool.get_new_blocks(3)
+
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    sched.request_finished(req, block_ids=kv_blocks.get_block_ids()[0])
+
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) > 0
+
+    simulate_store_completion(sched, meta.store_event)
+    fix.gpu_block_pool.free_blocks(fillers)
+
+
+def test_request_finished_all_groups_flushes_confirmed_store_blocks() -> None:
+    """HMA finish path should flush confirmed blocks for all KV groups."""
+    fix = make_scheduler(
+        num_cpu_blocks=16,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    group0 = _allocate_gpu_blocks(fix.gpu_block_pool, req, 2, group_id=0)
+    fillers = fix.gpu_block_pool.get_new_blocks(3)
+    kv_blocks = KVCacheBlocks(blocks=(group0,))
+    req.num_computed_tokens = 2 * BLOCK_SIZE
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    sched.request_finished_all_groups(req, kv_blocks.get_block_ids())
+    sched_out = make_scheduler_output({})
+    meta = sched.build_connector_meta(sched_out)
+
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) >= 2
+    assert len(meta.store_cpu_blocks) == len(meta.store_gpu_blocks)
+
+    fix.gpu_block_pool.free_blocks(fillers)
+
+
+def test_rotary_match_cap_zero_synced_blocks() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=4)
+    req.rotary_state = RequestRotaryState.ROTARY_SWAPPED
+    req.rotary_synced_blocks = 0
+    req.rotary_dirty_tail_tokens = 0
+
+    sched.cpu_coordinator.find_longest_cache_hit = lambda *_: ([], BLOCK_SIZE * 2)  # type: ignore[method-assign]
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
+
+    assert hit_tokens == 0
+    assert is_async is False
+
+
+def test_rotary_match_cap_respects_synced_blocks_and_dirty_tail() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=4)
+    req.rotary_state = RequestRotaryState.ROTARY_PENDING_IN
+    req.rotary_synced_blocks = 1
+    req.rotary_dirty_tail_tokens = 8
+
+    sched.cpu_coordinator.find_longest_cache_hit = (  # type: ignore[method-assign]
+        lambda _hashes, max_hit_len: ([], max_hit_len)
+    )
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
+
+    assert hit_tokens == BLOCK_SIZE
+    assert is_async is True
+
+
 # ---------------------------------------------------------------------------
 # Test 10: Partial GPU prefix hit + CPU load + new compute blocks
 # ---------------------------------------------------------------------------
@@ -1339,3 +1804,50 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
         assert bid in ext_block_ids, (
             f"Load GPU block {bid} should be an ext_comp block, not a comp or new block"
         )
+
+
+def test_has_pending_transfers_tracks_load_lifecycle() -> None:
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    num_blocks = 2
+    req = make_request(num_blocks=num_blocks)
+
+    # Materialize CPU cache with one eager store.
+    kv_blocks = _alloc_and_register(fix, req, num_blocks)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    block_ids = kv_blocks.get_block_ids()
+    sched_out = make_scheduler_output(
+        {req.request_id: num_blocks * BLOCK_SIZE},
+        new_reqs={req.request_id: block_ids},
+    )
+    store_meta = sched.build_connector_meta(sched_out)
+    assert store_meta.store_event >= 0
+    simulate_store_completion(sched, store_meta.store_event)
+
+    req2 = Request(
+        request_id="req-pending-load",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
+    assert hit_tokens is not None and hit_tokens > 0
+    assert is_async is True
+
+    gpu_blocks = fix.gpu_block_pool.get_new_blocks(num_blocks)
+    kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks,))
+    sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
+
+    # Pending load should be visible before and after load-event assignment.
+    assert sched.has_pending_transfers() is True
+
+    load_meta = sched.build_connector_meta(make_scheduler_output({req2.request_id: 1}))
+    assert load_meta.load_event >= 0
+    assert sched.has_pending_transfers() is True
+
+    simulate_load_completion(sched, {req2.request_id})
+    assert sched.has_pending_transfers() is False

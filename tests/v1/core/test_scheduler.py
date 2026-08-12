@@ -976,6 +976,139 @@ def test_proactive_swap_preempts_small_decode_backlog_candidate():
     assert any(req.req_id == waiting_req.request_id for req in out.scheduled_new_reqs)
 
 
+def test_proactive_swap_preempts_multiple_candidates_until_budget_met():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=5,
+        block_size=4,
+        num_blocks=8,
+        max_num_seqs=3,
+    )
+
+    req_a, req_b, req_c = create_requests(
+        num_requests=3,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["req-a", "req-b", "req-c"],
+    )
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["req-wait-budgeted"],
+    )[0]
+
+    for req in (req_a, req_b, req_c):
+        scheduler.add_request(req)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 3
+
+    for req in (req_a, req_b, req_c):
+        req.num_computed_tokens = req.num_tokens - 1
+
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert req_a.status == RequestStatus.RUNNING
+    assert req_b.status == RequestStatus.PREEMPTED
+    assert req_c.status == RequestStatus.PREEMPTED
+    assert waiting_req.status == RequestStatus.RUNNING
+    assert out.preempted_req_ids == {req_b.request_id, req_c.request_id}
+
+
+def test_proactive_swap_uses_waiting_block_pressure_above_static_budget():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=1,
+        block_size=4,
+        num_blocks=8,
+        max_num_seqs=3,
+    )
+
+    req_a, req_b, req_c = create_requests(
+        num_requests=3,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["req-pressure-a", "req-pressure-b", "req-pressure-c"],
+    )
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=12,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["req-wait-pressure"],
+    )[0]
+
+    for req in (req_a, req_b, req_c):
+        scheduler.add_request(req)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 3
+
+    for req in (req_a, req_b, req_c):
+        req.num_computed_tokens = req.num_tokens - 1
+
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 1
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert req_a.status == RequestStatus.RUNNING
+    assert req_b.status == RequestStatus.RUNNING
+    assert req_c.status == RequestStatus.PREEMPTED
+    assert waiting_req.status == RequestStatus.RUNNING
+    assert out.preempted_req_ids == {req_c.request_id}
+    assert any(req.req_id == waiting_req.request_id for req in out.scheduled_new_reqs)
+
+
+def test_proactive_swap_multi_vlt_keeps_slo_violating_request_running():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=5,
+        block_size=4,
+        num_blocks=8,
+        max_num_seqs=3,
+        policy="priority",
+    )
+    scheduler.scheduler_config.slo_ttft = 0.5
+
+    now = time.monotonic()
+    req_old, req_new_1, req_new_2 = create_requests_with_priority(
+        num_requests=3,
+        priorities=[0, 0, 0],
+        arrival_times=[now - 5.0, now - 0.2, now - 0.1],
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["req-old-slo", "req-new-slo-1", "req-new-slo-2"],
+    )
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["req-wait-slo"],
+    )[0]
+
+    for req in (req_old, req_new_1, req_new_2):
+        scheduler.add_request(req)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 3
+
+    for req in (req_old, req_new_1, req_new_2):
+        req.num_computed_tokens = req.num_tokens - 1
+
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert req_old.status == RequestStatus.RUNNING
+    assert req_new_1.status == RequestStatus.PREEMPTED
+    assert req_new_2.status == RequestStatus.PREEMPTED
+    assert waiting_req.status == RequestStatus.RUNNING
+    assert out.preempted_req_ids == {
+        req_new_1.request_id,
+        req_new_2.request_id,
+    }
+
+
 def test_proactive_swap_skips_small_prefill_backlog_candidate():
     scheduler = _create_simple_offload_scheduler_for_proactive_tests(
         proactive_swap_budget=4,
@@ -1361,7 +1494,61 @@ def test_proactive_swap_candidate_excludes_spec_and_placeholder_work():
     assert not scheduler._is_proactive_swap_candidate(req)
 
 
-def test_proactive_swap_skips_shared_prefix_cache_blocks():
+def test_proactive_swap_candidate_high_risk_allows_spec_and_placeholder_work():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+    )
+    scheduler._superinfer_high_risk_mode = True
+
+    req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-high-risk-unsafe-candidate"],
+    )[0]
+    scheduler.add_request(req)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 1
+
+    req.num_computed_tokens = req.num_tokens - 1
+    req.spec_token_ids = [101]
+    req.num_output_placeholders = 1
+
+    assert scheduler._estimate_request_owned_swap_blocks(req) > 0
+    assert scheduler._is_proactive_swap_candidate(req)
+
+
+def test_proactive_swap_candidate_high_risk_allows_prefill_chunks():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+    )
+    scheduler._superinfer_high_risk_mode = True
+
+    req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-high-risk-prefill"],
+    )[0]
+    scheduler.add_request(req)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 1
+
+    req.num_computed_tokens = req.num_tokens - 2
+    req.is_prefill_chunk = True
+    req._output_token_ids.clear()
+
+    assert scheduler._estimate_request_owned_swap_blocks(req) > 0
+    assert scheduler._is_proactive_swap_candidate(req)
+
+
+def test_proactive_swap_uses_owned_suffix_when_prefix_is_shared():
     scheduler = _create_simple_offload_scheduler_for_proactive_tests(
         proactive_swap_budget=4,
         block_size=4,
@@ -1398,18 +1585,16 @@ def test_proactive_swap_skips_shared_prefix_cache_blocks():
     )
 
     blocks = scheduler.kv_cache_manager.get_blocks(running_req.request_id).blocks[0]
-    shared_block = next(block for block in blocks if not block.is_null)
+    non_null_blocks = [block for block in blocks if not block.is_null]
+    assert len(non_null_blocks) >= 2
+    shared_block = non_null_blocks[0]
     assert shared_block.ref_cnt == 1
     shared_block.ref_cnt += 1
+    running_req.num_computed_tokens = running_req.num_tokens - 1
 
-    scheduler.add_request(waiting_req)
-    out = scheduler.schedule()
-
-    assert not scheduler._is_proactive_swap_candidate(running_req)
-    assert running_req.status == RequestStatus.RUNNING
-    assert running_req in scheduler.running
-    assert waiting_req in scheduler.waiting
-    assert running_req.request_id not in out.preempted_req_ids
+    assert scheduler._has_shared_kv_cache_blocks(running_req)
+    assert scheduler._estimate_request_owned_swap_blocks(running_req) > 0
+    assert scheduler._is_proactive_swap_candidate(running_req)
 
 
 def test_proactive_swap_default_priority_handles_mixed_candidate_shapes():
@@ -1526,7 +1711,7 @@ def test_proactive_swap_vlt_bandwidth_handles_mixed_candidate_shapes():
     assert req_small_backlog.request_id in out.preempted_req_ids
 
 
-def test_proactive_swap_preempt_sets_rotary_state_waiting():
+def test_proactive_swap_preempt_sets_rotary_state_swapped():
     scheduler = _create_simple_offload_scheduler_for_proactive_tests(
         proactive_swap_budget=4,
         block_size=4,
@@ -1566,7 +1751,18 @@ def test_proactive_swap_preempt_sets_rotary_state_waiting():
     _ = scheduler.schedule()
 
     assert running_req.status == RequestStatus.PREEMPTED
-    assert running_req.rotary_state == RequestRotaryState.WAITING
+    assert running_req.rotary_state == RequestRotaryState.ROTARY_SWAPPED
+    assert running_req.rotary_synced_blocks >= 0
+    assert running_req.rotary_unsynced_blocks >= 0
+    assert running_req.rotary_dirty_tail_tokens >= 0
+    assert running_req.rotary_preempted_at is not None
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_rotary_preempted_reqs == 1
+    assert stats.num_rotary_synced_blocks == running_req.rotary_synced_blocks
+    assert stats.num_rotary_unsynced_blocks == running_req.rotary_unsynced_blocks
+    assert stats.num_rotary_dirty_tail_tokens == running_req.rotary_dirty_tail_tokens
 
 
 def test_proactive_swap_preempted_request_can_resume_after_intervening_finish():
@@ -1672,6 +1868,196 @@ def test_proactive_swap_skips_when_transfers_pending():
     assert out.scheduled_new_reqs == []
 
     scheduler.connector.has_pending_transfers = orig  # type: ignore[method-assign]
+
+
+def test_proactive_swap_skips_when_cpu_swap_pool_is_full():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+    )
+
+    running_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-cpu-full"],
+    )[0]
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["waiting-cpu-full"],
+    )[0]
+
+    scheduler.add_request(running_req)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=["running-cpu-full"],
+            req_id_to_index={"running-cpu-full": 0},
+            sampled_token_ids=[[3030]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert scheduler.connector is not None
+    orig = scheduler.connector.get_num_free_cpu_blocks
+    scheduler.connector.get_num_free_cpu_blocks = Mock(return_value=0)  # type: ignore[method-assign]
+
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert running_req.status == RequestStatus.RUNNING
+    assert running_req in scheduler.running
+    assert waiting_req in scheduler.waiting
+    assert running_req.request_id not in out.preempted_req_ids
+
+    scheduler.connector.get_num_free_cpu_blocks = orig  # type: ignore[method-assign]
+
+
+def test_proactive_swap_limits_victims_to_cpu_swap_capacity():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=5,
+        block_size=4,
+        num_blocks=8,
+        max_num_seqs=3,
+    )
+
+    req_a, req_b, req_c = create_requests(
+        num_requests=3,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["req-cpu-cap-a", "req-cpu-cap-b", "req-cpu-cap-c"],
+    )
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["req-wait-cpu-cap"],
+    )[0]
+
+    for req in (req_a, req_b, req_c):
+        scheduler.add_request(req)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 3
+
+    for req in (req_a, req_b, req_c):
+        req.num_computed_tokens = req.num_tokens - 1
+
+    assert scheduler.connector is not None
+    orig = scheduler.connector.get_num_free_cpu_blocks
+    scheduler.connector.get_num_free_cpu_blocks = Mock(return_value=2)  # type: ignore[method-assign]
+
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert req_a.status == RequestStatus.RUNNING
+
+
+def test_proactive_swap_high_risk_mode_preempts_without_cooldown_or_low_gain_guard():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+        max_num_seqs=2,
+    )
+    scheduler._superinfer_high_risk_mode = True
+
+    req_a, req_b = create_requests(
+        num_requests=2,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["run-a", "run-b"],
+    )
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["wait-high-risk"],
+    )[0]
+
+    scheduler.add_request(req_a)
+    scheduler.add_request(req_b)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 2
+
+    now = time.monotonic()
+    req_a.num_computed_tokens = req_a.num_tokens - 1
+    req_b.num_computed_tokens = req_b.num_tokens - 1
+    req_a.rotary_last_preempted_at = now
+    req_b.rotary_last_preempted_at = now
+
+    scheduler.add_request(waiting_req)
+
+    out = scheduler.schedule()
+
+    assert out.preempted_req_ids
+    assert scheduler._proactive_cooldown_skips == 0
+    assert scheduler._proactive_low_gain_skips == 0
+    assert any(req.status == RequestStatus.PREEMPTED for req in (req_a, req_b))
+
+def test_proactive_swap_high_risk_mode_ignores_cpu_pressure_skip():
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+    )
+    scheduler._superinfer_high_risk_mode = True
+
+    running_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-high-cpu-pressure"],
+    )[0]
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["waiting-high-cpu-pressure"],
+    )[0]
+
+    scheduler.add_request(running_req)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=["running-high-cpu-pressure"],
+            req_id_to_index={"running-high-cpu-pressure": 0},
+            sampled_token_ids=[[111]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert scheduler.connector is not None
+    orig_free = scheduler.connector.get_num_free_cpu_blocks
+    orig_total = scheduler.connector.get_num_total_cpu_blocks
+    scheduler.connector.get_num_free_cpu_blocks = Mock(return_value=1)  # type: ignore[method-assign]
+    scheduler.connector.get_num_total_cpu_blocks = Mock(return_value=100)  # type: ignore[method-assign]
+    scheduler._estimate_request_unsynced_swap_blocks = Mock(return_value=0)  # type: ignore[method-assign]
+
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert scheduler._proactive_cpu_pressure_skips == 0
+    assert running_req.request_id in out.preempted_req_ids
+
+    scheduler.connector.get_num_free_cpu_blocks = orig_free  # type: ignore[method-assign]
+    scheduler.connector.get_num_total_cpu_blocks = orig_total  # type: ignore[method-assign]
 
 
 def test_proactive_swap_vlt_weights_choose_small_swap_candidate():
@@ -5241,6 +5627,31 @@ def test_fcfs_mixed_skipped_waiting_types_keep_order():
     scheduler._update_waiting_for_remote_kv.assert_called_once_with(req_remote)
 
 
+def test_rotary_cap_zero_external_tokens_disables_async_waiting_state():
+    scheduler = create_scheduler(max_num_seqs=1, use_kv_connector=True)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (16, True)
+
+    req = create_requests(
+        num_requests=1,
+        num_tokens=16,
+        max_tokens=1,
+        req_ids=["rotary-cap-zero"],
+    )[0]
+    req.rotary_state = RequestRotaryState.ROTARY_SWAPPED
+    req.rotary_synced_blocks = 0
+    req.rotary_dirty_tail_tokens = 0
+
+    scheduler.add_request(req)
+    out = scheduler.schedule()
+
+    assert req.status == RequestStatus.RUNNING
+    assert req.request_id not in {
+        r.request_id for r in list(scheduler.skipped_waiting)
+    }
+    assert req.request_id in out.num_scheduled_tokens
+
+
 def test_abort_request_waiting_for_remote_kvs():
     scheduler = create_scheduler(use_kv_connector=True)
 
@@ -5268,6 +5679,170 @@ def test_abort_request_waiting_for_remote_kvs():
     # assert request is deleted
     assert request.request_id not in scheduler.requests
     assert not scheduler.finished_recving_kv_req_ids
+
+
+def test_remote_wait_entry_and_promotion_stats() -> None:
+    scheduler = create_scheduler(max_num_seqs=1, use_kv_connector=True)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (1, True)
+
+    request = create_requests(num_requests=1, num_tokens=4, req_ids=["remote-stats"])[0]
+    scheduler.add_request(request)
+
+    scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_remote_wait_entries == 1
+    assert stats.num_remote_wait_promotions == 0
+
+    scheduler.finished_recving_kv_req_ids.add(request.request_id)
+    scheduler.schedule()
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_remote_wait_entries == 0
+    assert stats.num_remote_wait_promotions == 1
+
+
+def test_zero_external_tokens_do_not_enter_remote_waiting() -> None:
+    scheduler = create_scheduler(max_num_seqs=1, use_kv_connector=True)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, True)
+
+    request = create_requests(num_requests=1, num_tokens=8, req_ids=["remote-zero-ext"])[0]
+    scheduler.add_request(request)
+
+    out = scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert request.request_id in out.num_scheduled_tokens
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_remote_wait_entries == 0
+
+
+def test_proactive_skip_reason_stats_tracked() -> None:
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+    )
+
+    # No waiting requests should trigger no-waiting proactive skip accounting.
+    scheduler.schedule()
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_proactive_no_waiting_skips >= 1
+
+    # Pending transfer should be counted as a skip reason.
+    assert scheduler.connector is not None
+    orig_pending = scheduler.connector.has_pending_transfers
+    scheduler.connector.has_pending_transfers = Mock(return_value=True)  # type: ignore[method-assign]
+
+    running_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-skip-stats"],
+    )[0]
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["waiting-skip-stats"],
+    )[0]
+
+    scheduler.add_request(running_req)
+    scheduler.schedule()
+    running_req.num_computed_tokens = running_req.num_tokens - 1
+    scheduler.add_request(waiting_req)
+    scheduler.schedule()
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_proactive_pending_transfer_skips >= 1
+
+    scheduler.connector.has_pending_transfers = orig_pending  # type: ignore[method-assign]
+
+
+def test_proactive_skip_cpu_pressure_when_cpu_swap_pool_near_full() -> None:
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=4,
+        block_size=4,
+        num_blocks=6,
+    )
+
+    running_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-cpu-pressure"],
+    )[0]
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["waiting-cpu-pressure"],
+    )[0]
+
+    scheduler.add_request(running_req)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=["running-cpu-pressure"],
+            req_id_to_index={"running-cpu-pressure": 0},
+            sampled_token_ids=[[5050]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    assert scheduler.connector is not None
+    orig_total = scheduler.connector.get_num_total_cpu_blocks
+    orig_free = scheduler.connector.get_num_free_cpu_blocks
+    scheduler.connector.get_num_total_cpu_blocks = Mock(return_value=100)  # type: ignore[method-assign]
+    scheduler.connector.get_num_free_cpu_blocks = Mock(return_value=4)  # type: ignore[method-assign]
+
+    scheduler.add_request(waiting_req)
+    out = scheduler.schedule()
+
+    assert running_req.status == RequestStatus.RUNNING
+    assert waiting_req.status != RequestStatus.RUNNING
+    assert running_req.request_id not in out.preempted_req_ids
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_proactive_cpu_pressure_skips >= 1
+
+    scheduler.connector.get_num_total_cpu_blocks = orig_total  # type: ignore[method-assign]
+    scheduler.connector.get_num_free_cpu_blocks = orig_free  # type: ignore[method-assign]
+
+
+def test_blocked_remote_wait_does_not_starve_ready_waiting_fcfs() -> None:
+    scheduler = create_scheduler(max_num_seqs=1, use_kv_connector=True)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
+
+    blocked = create_requests(num_requests=1, num_tokens=8, req_ids=["blocked-remote"])[0]
+    ready = create_requests(num_requests=1, num_tokens=8, req_ids=["ready-waiting"])[0]
+    blocked.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    scheduler.add_request(blocked)
+    scheduler.add_request(ready)
+
+    out = scheduler.schedule()
+    assert out.scheduled_new_reqs
+    assert out.scheduled_new_reqs[0].req_id == ready.request_id
+    assert blocked in scheduler.skipped_waiting
+    assert ready in scheduler.running
 
 
 def test_abort_request_finished_recving():

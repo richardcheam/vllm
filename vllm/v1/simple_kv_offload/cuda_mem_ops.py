@@ -68,7 +68,9 @@ def _resolve_batch_memcpy():
 class BatchMemcpyParams(NamedTuple):
     src_bases: np.ndarray  # [num_layers] uint64 — data_ptr per layer
     dst_bases: np.ndarray  # [num_layers] uint64
-    bpb: np.ndarray  # [num_layers] uint64 — bytes per block
+    src_bpb: np.ndarray  # [num_layers] uint64 — source bytes-per-block stride
+    dst_bpb: np.ndarray  # [num_layers] uint64 — destination bytes-per-block stride
+    copy_bpb: np.ndarray  # [num_layers] uint64 — copied bytes per block
     num_layers: int
     attrs: _CUmemcpyAttributes
     attrs_idx: ctypes.c_size_t
@@ -76,6 +78,13 @@ class BatchMemcpyParams(NamedTuple):
     # cuMemcpyBatchAsync() with fail_idx for backward compatibility
     fail_idx: ctypes.c_size_t
     stream_handle: int  # raw cudaStream_t / CUstream
+
+
+class BatchCopyArrays(NamedTuple):
+    src_all: np.ndarray
+    dst_all: np.ndarray
+    sz_all: np.ndarray
+    total: int
 
 
 def build_params(
@@ -91,13 +100,17 @@ def build_params(
     src_tensors = list(src_caches.values())
     dst_tensors = list(dst_caches.values())
 
-    src_bases, dst_bases, bpb = [], [], []
+    src_bases, dst_bases, src_bpb, dst_bpb, copy_bpb = [], [], [], [], []
     for s, d in zip(src_tensors, dst_tensors):
         s_bpb = s.stride(0) * s.element_size()
-        assert s_bpb == d.stride(0) * d.element_size()
+        d_bpb = d.stride(0) * d.element_size()
+        if s_bpb <= 0 or d_bpb <= 0:
+            raise ValueError("bytes-per-block strides must be positive")
         src_bases.append(s.data_ptr())
         dst_bases.append(d.data_ptr())
-        bpb.append(s_bpb)
+        src_bpb.append(s_bpb)
+        dst_bpb.append(d_bpb)
+        copy_bpb.append(min(s_bpb, d_bpb))
 
     # Refer to https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MEM.html#group__CUDA__MEM_1g6f1ff58e3065df3eb4b573dba77ad31f for details.  # noqa: E501
     attrs = _CUmemcpyAttributes(srcAccessOrder=3)  # ANY
@@ -105,7 +118,9 @@ def build_params(
     return BatchMemcpyParams(
         src_bases=np.array(src_bases, dtype=np.uint64),
         dst_bases=np.array(dst_bases, dtype=np.uint64),
-        bpb=np.array(bpb, dtype=np.uint64),
+        src_bpb=np.array(src_bpb, dtype=np.uint64),
+        dst_bpb=np.array(dst_bpb, dtype=np.uint64),
+        copy_bpb=np.array(copy_bpb, dtype=np.uint64),
         num_layers=len(src_tensors),
         attrs=attrs,
         attrs_idx=ctypes.c_size_t(0),
@@ -120,27 +135,48 @@ def copy_blocks(
     params: BatchMemcpyParams,
 ) -> None:
     """Copy blocks via cuMemcpyBatchAsync."""
+    arrays = prepare_batch_copy_arrays(src_block_ids, dst_block_ids, params)
+    if arrays is None:
+        return
+
+    submit_batch_copy(arrays, params)
+
+
+def prepare_batch_copy_arrays(
+    src_block_ids: list[int],
+    dst_block_ids: list[int],
+    params: BatchMemcpyParams,
+) -> BatchCopyArrays | None:
+    """Prepare flattened pointer/size arrays for batch copy submission."""
+    if len(src_block_ids) != len(dst_block_ids):
+        raise ValueError("src_block_ids and dst_block_ids must have equal length")
+
     n = len(src_block_ids)
     if n == 0:
-        return
+        return None
 
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
 
     src_all = (
-        params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
+        params.src_bases[:, None] + src_ids[None, :] * params.src_bpb[:, None]
     ).ravel()
     dst_all = (
-        params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
+        params.dst_bases[:, None] + dst_ids[None, :] * params.dst_bpb[:, None]
     ).ravel()
-    sz_all = np.repeat(params.bpb, n)
+    sz_all = np.repeat(params.copy_bpb, n)
 
     total = n * params.num_layers
+    return BatchCopyArrays(src_all=src_all, dst_all=dst_all, sz_all=sz_all, total=total)
+
+
+def submit_batch_copy(arrays: BatchCopyArrays, params: BatchMemcpyParams) -> None:
+    """Submit prepared arrays to cuMemcpyBatchAsync."""
     err = _batch_memcpy_fn(
-        dst_all.ctypes.data,
-        src_all.ctypes.data,
-        sz_all.ctypes.data,
-        total,
+        arrays.dst_all.ctypes.data,
+        arrays.src_all.ctypes.data,
+        arrays.sz_all.ctypes.data,
+        arrays.total,
         ctypes.addressof(params.attrs),
         ctypes.byref(params.attrs_idx),
         1,

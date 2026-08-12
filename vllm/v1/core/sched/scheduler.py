@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -57,7 +58,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
-from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.request import (
+    Request,
+    RequestRotaryState,
+    RequestStatus,
+    StreamingUpdate,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -183,6 +189,29 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # SuperInfer rotary accounting emitted through SchedulerStats.
+        self._rotary_preemptions = 0
+        self._rotary_synced_blocks = 0
+        self._rotary_unsynced_blocks = 0
+        self._rotary_dirty_tail_tokens = 0
+        self._remote_wait_entries = 0
+        self._remote_wait_promotions = 0
+        self._proactive_cooldown_skips = 0
+        self._proactive_low_gain_skips = 0
+        self._proactive_no_waiting_skips = 0
+        self._proactive_pending_transfer_skips = 0
+        self._proactive_already_free_skips = 0
+        self._proactive_cpu_capacity_skips = 0
+        self._proactive_no_candidate_rounds = 0
+        self._proactive_cpu_pressure_skips = 0
+        self._proactive_locality_penalty_s = 0.0
+
+        # Guard against preempting the same request too frequently.
+        self._proactive_preempt_cooldown_s = 0.05
+        self._superinfer_high_risk_mode = bool(
+            self.cache_config.superinfer_high_risk_mode
+        )
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -654,7 +683,13 @@ class Scheduler(SchedulerInterface):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
-                        num_external_computed_tokens = ext_tokens
+                        num_external_computed_tokens = self._cap_rotary_external_tokens(
+                            request,
+                            ext_tokens,
+                            num_new_local_computed_tokens,
+                        )
+                        if num_external_computed_tokens <= 0:
+                            load_kv_async = False
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -820,6 +855,12 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    if request.rotary_state == RequestRotaryState.ROTARY_SWAPPED:
+                        request.set_rotary_state(
+                            RequestRotaryState.ROTARY_PENDING_IN,
+                            force=True,
+                        )
+                    self._remote_wait_entries += 1
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -859,6 +900,11 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if request.rotary_state in (
+                    RequestRotaryState.ROTARY_SWAPPED,
+                    RequestRotaryState.ROTARY_PENDING_IN,
+                ):
+                    self._clear_rotary_swap_accounting(request)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -986,11 +1032,13 @@ class Scheduler(SchedulerInterface):
     def _is_proactive_swap_candidate(self, request: Request) -> bool:
         if request.status != RequestStatus.RUNNING:
             return False
+        if self._estimate_request_owned_swap_blocks(request) <= 0:
+            return False
+        if self._superinfer_high_risk_mode:
+            return request.num_tokens > request.num_computed_tokens
         if request.num_output_placeholders > 0:
             return False
         if request.spec_token_ids:
-            return False
-        if self._has_shared_kv_cache_blocks(request):
             return False
         remaining_tokens = request.num_tokens - request.num_computed_tokens
         if remaining_tokens == 1:
@@ -999,7 +1047,7 @@ class Scheduler(SchedulerInterface):
             return False
         if request.is_prefill_chunk or request.num_output_tokens == 0:
             return False
-        return remaining_tokens <= self.block_size
+        return remaining_tokens <= 2 * self.block_size
 
     def _has_shared_kv_cache_blocks(self, request: Request) -> bool:
         try:
@@ -1011,18 +1059,115 @@ class Scheduler(SchedulerInterface):
             block.ref_cnt > 1 and not block.is_null for group in blocks for block in group
         )
 
-    def _estimate_request_swap_bytes(self, request: Request) -> int:
+    def _estimate_request_swap_blocks(self, request: Request) -> int:
         try:
             blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
         except KeyError:
             return 0
 
-        num_blocks = sum(
+        return sum(
             1
             for group in blocks
             for block in group
             if block.block_hash is not None and not block.is_null
         )
+
+    def _estimate_request_owned_swap_blocks(self, request: Request) -> int:
+        try:
+            blocks = self.kv_cache_manager.get_blocks(request.request_id).blocks
+        except KeyError:
+            return 0
+
+        return sum(
+            1
+            for group in blocks
+            for block in group
+            if block.block_hash is not None and not block.is_null and block.ref_cnt <= 1
+        )
+
+    def _estimate_request_cpu_resident_blocks(self, request: Request) -> int:
+        get_cpu_resident_owned_blocks = getattr(
+            self.connector,
+            "get_num_cpu_resident_owned_blocks",
+            None,
+        )
+        if callable(get_cpu_resident_owned_blocks):
+            resident_owned_blocks = get_cpu_resident_owned_blocks(request)
+            if isinstance(resident_owned_blocks, int) and resident_owned_blocks > 0:
+                return min(resident_owned_blocks, self._estimate_request_owned_swap_blocks(request))
+
+        get_cpu_resident_blocks = getattr(
+            self.connector,
+            "get_num_cpu_resident_blocks",
+            None,
+        )
+        if not callable(get_cpu_resident_blocks):
+            return 0
+
+        resident_blocks = get_cpu_resident_blocks(request)
+        if not isinstance(resident_blocks, int) or resident_blocks <= 0:
+            return 0
+        return min(resident_blocks, self._estimate_request_owned_swap_blocks(request))
+
+    def _estimate_request_unsynced_swap_blocks(self, request: Request) -> int:
+        return max(
+            self._estimate_request_owned_swap_blocks(request)
+            - self._estimate_request_cpu_resident_blocks(request),
+            0,
+        )
+
+    def _cap_rotary_external_tokens(
+        self,
+        request: Request,
+        ext_tokens: int,
+        num_local_computed_tokens: int,
+    ) -> int:
+        if ext_tokens <= 0:
+            return 0
+        if request.rotary_state not in (
+            RequestRotaryState.ROTARY_SWAPPED,
+            RequestRotaryState.ROTARY_PENDING_IN,
+        ):
+            return ext_tokens
+
+        del num_local_computed_tokens
+        synced_cap = max(int(request.rotary_synced_blocks), 0) * self.block_size
+        if synced_cap <= 0:
+            ext_tokens = 0
+        else:
+            ext_tokens = min(ext_tokens, synced_cap)
+
+        dirty_tail = max(int(request.rotary_dirty_tail_tokens), 0)
+        if dirty_tail > 0:
+            ext_tokens = min(ext_tokens, max(request.num_tokens - dirty_tail, 0))
+
+        return max(ext_tokens, 0)
+
+    def _clear_rotary_swap_accounting(self, request: Request) -> None:
+        request.rotary_synced_blocks = 0
+        request.rotary_unsynced_blocks = 0
+        request.rotary_dirty_tail_tokens = 0
+        request.rotary_preempted_at = None
+
+    def _record_rotary_swap_accounting(
+        self,
+        request: Request,
+        timestamp: float,
+    ) -> None:
+        total_full_blocks = self._estimate_request_owned_swap_blocks(request)
+        synced_blocks = self._estimate_request_cpu_resident_blocks(request)
+        request.rotary_synced_blocks = synced_blocks
+        request.rotary_unsynced_blocks = max(total_full_blocks - synced_blocks, 0)
+        request.rotary_dirty_tail_tokens = request.num_computed_tokens % self.block_size
+        request.rotary_preempted_at = timestamp
+        request.rotary_last_preempted_at = timestamp
+        self._rotary_preemptions += 1
+        self._rotary_synced_blocks += request.rotary_synced_blocks
+        self._rotary_unsynced_blocks += request.rotary_unsynced_blocks
+        self._rotary_dirty_tail_tokens += request.rotary_dirty_tail_tokens
+
+    def _estimate_request_swap_bytes(self, request: Request) -> int:
+        num_blocks = self._estimate_request_unsynced_swap_blocks(request)
         if num_blocks <= 0 or self.kv_cache_config.num_blocks <= 0:
             return 0
 
@@ -1032,6 +1177,79 @@ class Scheduler(SchedulerInterface):
 
         bytes_per_block = total_bytes // self.kv_cache_config.num_blocks
         return num_blocks * bytes_per_block
+
+    def _estimate_request_locality_penalty_s(self, request: Request) -> float:
+        estimate_penalty = getattr(
+            self.connector,
+            "estimate_request_remote_penalty_seconds",
+            None,
+        )
+        if not callable(estimate_penalty):
+            return 0.0
+        penalty = estimate_penalty(request)
+        if not isinstance(penalty, (int, float)):
+            return 0.0
+        return max(float(penalty), 0.0)
+
+    def _is_in_proactive_cooldown(self, request: Request, now_s: float) -> bool:
+        if self._superinfer_high_risk_mode:
+            return False
+        last = request.rotary_last_preempted_at
+        if last is None:
+            return False
+        return (now_s - last) < self._proactive_preempt_cooldown_s
+
+    def _estimate_proactive_gain_blocks(self, request: Request) -> int:
+        # Prefer immediate reclaimability: blocks already resident on CPU are
+        # available without additional D2H time and typically translate to more
+        # predictable allocator relief under pressure.
+        synced = self._estimate_request_cpu_resident_blocks(request)
+        if synced > 0:
+            return synced
+        return max(self._estimate_request_owned_swap_blocks(request), 0)
+
+    def _estimate_waiting_block_pressure(self) -> int:
+        requests = []
+        if self.waiting:
+            requests.append(self.waiting.peek_request())
+        if self.skipped_waiting:
+            requests.append(self.skipped_waiting.peek_request())
+        if not requests:
+            return 0
+
+        return max(
+            self._estimate_request_immediate_block_pressure(req) for req in requests
+        )
+
+    def _estimate_request_immediate_block_pressure(self, request: Request) -> int:
+        remaining_tokens = request.num_tokens - request.num_computed_tokens
+        if remaining_tokens <= 0:
+            return 0
+
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold > 0:
+            remaining_tokens = min(remaining_tokens, threshold)
+        remaining_tokens = min(remaining_tokens, self.max_num_scheduled_tokens)
+        return math.ceil(remaining_tokens / self.block_size)
+
+    def _estimate_cpu_pressure_ratio(self) -> float | None:
+        if self.connector is None:
+            return None
+
+        get_cpu_free_blocks = getattr(self.connector, "get_num_free_cpu_blocks", None)
+        get_cpu_total_blocks = getattr(self.connector, "get_num_total_cpu_blocks", None)
+        if not callable(get_cpu_free_blocks) or not callable(get_cpu_total_blocks):
+            return None
+
+        free_blocks = get_cpu_free_blocks()
+        total_blocks = get_cpu_total_blocks()
+        if not isinstance(free_blocks, int) or not isinstance(total_blocks, int):
+            return None
+        if total_blocks <= 0:
+            return None
+
+        used_blocks = max(total_blocks - max(free_blocks, 0), 0)
+        return min(max(used_blocks / total_blocks, 0.0), 1.0)
 
     def _estimate_vlt_latencies(
         self, request: Request, now_s: float
@@ -1093,11 +1311,13 @@ class Scheduler(SchedulerInterface):
         for req in candidates:
             predicted_ttft_s, predicted_tbt_s = self._estimate_vlt_latencies(req, now)
             time_in_system = max(now - req.arrival_time, 0.0)
+            locality_penalty_s = self._estimate_request_locality_penalty_s(req)
+            self._proactive_locality_penalty_s += locality_penalty_s
 
             inputs = VLTInputs(
                 predicted_ttft_s=predicted_ttft_s,
                 predicted_tbt_s=predicted_tbt_s,
-                predicted_future_delay_s=time_in_system,
+                predicted_future_delay_s=time_in_system + locality_penalty_s,
                 swap_bytes=self._estimate_request_swap_bytes(req),
                 swap_bandwidth_bytes_per_s=bandwidth_bytes_per_s,
             )
@@ -1116,7 +1336,6 @@ class Scheduler(SchedulerInterface):
             else:
                 tie_break = (
                     -float(running_index.get(req.request_id, 0)),
-                    0.0,
                     req.request_id,
                 )
             scored.append((score, tie_break, req))
@@ -1130,6 +1349,7 @@ class Scheduler(SchedulerInterface):
         if self._pause_state != PauseState.UNPAUSED:
             return []
         if not self.waiting and not self.skipped_waiting:
+            self._proactive_no_waiting_skips += 1
             return []
 
         kv_cfg = self.vllm_config.kv_transfer_config
@@ -1142,28 +1362,97 @@ class Scheduler(SchedulerInterface):
 
         has_pending = getattr(self.connector, "has_pending_transfers", None)
         if callable(has_pending) and has_pending():
+            self._proactive_pending_transfer_skips += 1
             return []
+        get_cpu_free_blocks = getattr(self.connector, "get_num_free_cpu_blocks", None)
+        cpu_free_blocks: int | None = None
+        if callable(get_cpu_free_blocks):
+            maybe_cpu_free_blocks = get_cpu_free_blocks()
+            if isinstance(maybe_cpu_free_blocks, int):
+                cpu_free_blocks = max(maybe_cpu_free_blocks, 0)
 
+        if not self._superinfer_high_risk_mode:
+            cpu_pressure_ratio = self._estimate_cpu_pressure_ratio()
+            if cpu_pressure_ratio is not None and cpu_pressure_ratio >= 0.95:
+                self._proactive_cpu_pressure_skips += 1
+                return []
+
+        waiting_block_pressure = self._estimate_waiting_block_pressure()
         target_free = min(
-            budget,
+            max(budget, waiting_block_pressure),
             max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0),
         )
         if target_free <= 0:
             return []
         if self.kv_cache_manager.block_pool.get_num_free_blocks() >= target_free:
+            self._proactive_already_free_skips += 1
             return []
 
-        candidates = [
-            req for req in self.running if self._is_proactive_swap_candidate(req)
-        ]
-        if not candidates:
-            return []
+        preempted_reqs: list[Request] = []
+        while self.kv_cache_manager.block_pool.get_num_free_blocks() < target_free:
+            now = time.monotonic()
+            candidates = []
+            for req in self.running:
+                if not self._is_proactive_swap_candidate(req):
+                    continue
+                if self._is_in_proactive_cooldown(req, now):
+                    self._proactive_cooldown_skips += 1
+                    continue
+                if cpu_free_blocks is not None:
+                    total_swap_blocks = self._estimate_request_owned_swap_blocks(req)
+                    unsynced_swap_blocks = self._estimate_request_unsynced_swap_blocks(
+                        req
+                    )
+                    if total_swap_blocks <= 0 or unsynced_swap_blocks > cpu_free_blocks:
+                        continue
+                candidates.append(req)
+            if not candidates:
+                self._proactive_no_candidate_rounds += 1
+                break
 
-        victim = self._select_proactive_swap_victim(candidates)
+            if not self._superinfer_high_risk_mode:
+                fully_synced_candidates = [
+                    req
+                    for req in candidates
+                    if self._estimate_request_unsynced_swap_blocks(req) == 0
+                ]
+                if fully_synced_candidates:
+                    candidates = fully_synced_candidates
 
-        self.running.remove(victim)
-        self._preempt_request(victim, timestamp)
-        return [victim]
+            victim: Request | None = None
+            candidate_pool = list(candidates)
+            while candidate_pool:
+                selected = self._select_proactive_swap_victim(candidate_pool)
+                free_now = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                needed_gain = max(target_free - free_now, 0)
+                estimated_gain = self._estimate_proactive_gain_blocks(selected)
+                min_gain = 1 if self._superinfer_high_risk_mode else (2 if needed_gain >= 2 else 1)
+                if (
+                    not self._superinfer_high_risk_mode
+                    and self._estimate_request_unsynced_swap_blocks(selected) > 0
+                ):
+                    min_gain = max(min_gain, 2)
+                if estimated_gain >= min_gain:
+                    victim = selected
+                    break
+                self._proactive_low_gain_skips += 1
+                candidate_pool.remove(selected)
+
+            if victim is None:
+                break
+            if cpu_free_blocks is not None:
+                unsynced_blocks = self._estimate_request_unsynced_swap_blocks(victim)
+                if unsynced_blocks > cpu_free_blocks:
+                    self._proactive_cpu_capacity_skips += 1
+                    break
+                cpu_free_blocks -= unsynced_blocks
+            self.running.remove(victim)
+            self._record_rotary_swap_accounting(victim, timestamp)
+            self._preempt_request(victim, timestamp)
+            victim.set_rotary_state(RequestRotaryState.ROTARY_SWAPPED, force=True)
+            preempted_reqs.append(victim)
+
+        return preempted_reqs
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -2035,6 +2324,8 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._clear_rotary_swap_accounting(request)
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -2185,13 +2476,28 @@ class Scheduler(SchedulerInterface):
         kv_total_blocks = max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0)
         kv_free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         kv_used_blocks = max(kv_total_blocks - kv_free_blocks, 0)
-        return SchedulerStats(
+        stats = SchedulerStats(
             num_active_reqs=len(self.requests),
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             num_preempted_reqs=num_preempted_reqs,
+            num_rotary_preempted_reqs=self._rotary_preemptions,
+            num_rotary_synced_blocks=self._rotary_synced_blocks,
+            num_rotary_unsynced_blocks=self._rotary_unsynced_blocks,
+            num_rotary_dirty_tail_tokens=self._rotary_dirty_tail_tokens,
+            num_proactive_cooldown_skips=self._proactive_cooldown_skips,
+            num_proactive_low_gain_skips=self._proactive_low_gain_skips,
+            num_proactive_no_waiting_skips=self._proactive_no_waiting_skips,
+            num_proactive_pending_transfer_skips=self._proactive_pending_transfer_skips,
+            num_proactive_already_free_skips=self._proactive_already_free_skips,
+            num_proactive_cpu_capacity_skips=self._proactive_cpu_capacity_skips,
+            num_proactive_no_candidate_rounds=self._proactive_no_candidate_rounds,
+            num_proactive_cpu_pressure_skips=self._proactive_cpu_pressure_skips,
+            proactive_locality_penalty_ms=int(self._proactive_locality_penalty_s * 1000.0),
             num_waiting_for_remote_kv_reqs=num_waiting_for_remote_kv_reqs,
+            num_remote_wait_entries=self._remote_wait_entries,
+            num_remote_wait_promotions=self._remote_wait_promotions,
             num_waiting_for_structured_output_reqs=(
                 num_waiting_for_structured_output_reqs
             ),
@@ -2212,6 +2518,22 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )
+        self._rotary_preemptions = 0
+        self._rotary_synced_blocks = 0
+        self._rotary_unsynced_blocks = 0
+        self._rotary_dirty_tail_tokens = 0
+        self._proactive_cooldown_skips = 0
+        self._proactive_low_gain_skips = 0
+        self._proactive_no_waiting_skips = 0
+        self._proactive_pending_transfer_skips = 0
+        self._proactive_already_free_skips = 0
+        self._proactive_cpu_capacity_skips = 0
+        self._proactive_no_candidate_rounds = 0
+        self._proactive_cpu_pressure_skips = 0
+        self._proactive_locality_penalty_s = 0.0
+        self._remote_wait_entries = 0
+        self._remote_wait_promotions = 0
+        return stats
 
     def make_spec_decoding_stats(
         self,
@@ -2303,12 +2625,27 @@ class Scheduler(SchedulerInterface):
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
+            dirty_tail = max(int(request.rotary_dirty_tail_tokens), 0)
+            if (
+                request.rotary_state
+                in (
+                    RequestRotaryState.ROTARY_PENDING_IN,
+                    RequestRotaryState.ROTARY_SWAPPED,
+                )
+                and dirty_tail > 0
+            ):
+                request.num_computed_tokens = min(
+                    request.num_computed_tokens,
+                    max(request.num_tokens - dirty_tail, 0),
+                )
+
             # on a full prompt hit, we need to re-compute the last token
             # in order to be able to sample the next token
             if request.num_computed_tokens == request.num_tokens:
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
+        self._clear_rotary_swap_accounting(request)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
         """
@@ -2321,6 +2658,7 @@ class Scheduler(SchedulerInterface):
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
             self._update_waiting_for_remote_kv(request)
+            self._remote_wait_promotions += 1
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:

@@ -148,6 +148,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -206,6 +208,13 @@ cython_debug/
 
 # Results
 *.csv
+*.log.cmd
+*.log.profile
+logs/
+benchmark_artifacts/
+observability/data/
+observability/node_exporter_textfile/*.prom
+docs/benchmarking/*_quick.json
 
 # Python pickle files
 *.pkl

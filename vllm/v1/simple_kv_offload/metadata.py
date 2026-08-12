@@ -26,6 +26,7 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     load_event: int = INVALID_JOB_ID
     load_gpu_blocks: list[int] = field(default_factory=list)
     load_cpu_blocks: list[int] = field(default_factory=list)
+    load_cpu_block_localities: dict[int, list[str]] = field(default_factory=dict)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
 
@@ -33,9 +34,14 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     store_event: int = INVALID_JOB_ID
     store_gpu_blocks: list[int] = field(default_factory=list)
     store_cpu_blocks: list[int] = field(default_factory=list)
+    store_cpu_block_localities: list[str] = field(default_factory=list)
 
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
+
+    # Static SuperInfer compatibility knobs carried for worker-side validation.
+    pin_memory_fix: bool = False
+    swapper_block_first: bool = False
 
 
 @dataclass

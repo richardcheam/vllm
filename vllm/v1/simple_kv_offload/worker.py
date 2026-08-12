@@ -9,8 +9,14 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, InlineCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.layout import (
+    LayoutModeDecision,
+    OffloadLayoutDescriptor,
+    build_gpu_cache_views,
+    choose_layout_mode,
+)
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -30,21 +36,34 @@ class SimpleCPUOffloadWorker:
         vllm_config: VllmConfig,
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
+        pin_memory_fix: bool = False,
+        swapper_block_first: bool = False,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.cpu_capacity_bytes = cpu_capacity_bytes
+        self._pin_memory_fix = pin_memory_fix
+        self._swapper_block_first = swapper_block_first
+        self._superinfer_high_risk_mode = bool(
+            vllm_config.cache_config.superinfer_high_risk_mode
+        )
+        self._reported_static_metadata_mismatch = False
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+        self.layout_descriptor: OffloadLayoutDescriptor | None = None
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
+        self._block_first_slab: torch.Tensor | None = None
 
         # CUDA streams for the async transfers
         self.load_stream: torch.cuda.Stream | None = None
         self.store_stream: torch.cuda.Stream | None = None
 
-        self._backend = DmaCopyBackend()
+        if self._superinfer_high_risk_mode:
+            self._backend = InlineCopyBackend()
+        else:
+            self._backend = DmaCopyBackend()
 
         # Ordered (event_idx, Event). Events pre-allocated on main thread.
         self._load_events: list[tuple[int, torch.Event]] = []
@@ -91,46 +110,40 @@ class SimpleCPUOffloadWorker:
         any_tensor = _repr_tensor(next(iter(kv_caches.values())))
         self.device = any_tensor.device
 
+        has_non_tensor_values = any(
+            not isinstance(value, torch.Tensor) for value in kv_caches.values()
+        )
+        model_arches = tuple(self.vllm_config.model_config.architectures or ())
+        num_kv_cache_groups = (
+            len(self.kv_cache_config.kv_cache_groups)
+            if self.kv_cache_config is not None
+            else 0
+        )
+        layout_decision: LayoutModeDecision = choose_layout_mode(
+            self._swapper_block_first,
+            model_arches=model_arches,
+            num_kv_cache_groups=num_kv_cache_groups,
+            has_non_tensor_values=has_non_tensor_values,
+            tensor_parallel_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            aggressive_mode=self._superinfer_high_risk_mode,
+        )
+        if self._swapper_block_first and layout_decision.mode != "block_first":
+            logger.warning(
+                "swapper_block_first requested but using gpu_derived layout (%s)",
+                layout_decision.reason,
+            )
+
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
 
-        # Deduplicate: multiple layers may share the same backing storage.
-        seen_ptrs: dict[int, tuple[str, torch.Tensor]] = {}
-        for name, value in kv_caches.items():
-            tensor = _repr_tensor(value)
-            ptr = tensor.untyped_storage().data_ptr()
-            if ptr not in seen_ptrs:
-                seen_ptrs[ptr] = (name, tensor)
-
-        # Build [num_blocks, block_bytes] int8 views from each unique
-        # storage so that stride(0) gives block_bytes for the copy op.
-        #
-        # The physical layout varies across attention backends:
-        #   FlashAttn/ROCm:  (2, num_blocks, ...) -> K/V outermost, 2 segments
-        #   FlashInfer/MLA:  (num_blocks, ...)    -> blocks outermost, 1 segment
-        # We derive page_size_bytes = storage.nbytes() // num_blocks, then
-        # classify dims: any dim whose byte-stride exceeds page_size_bytes
-        # must be an outer segment dim (e.g. the K/V dim of size 2). A less
-        # hacky way is to update the interface with the layout.
-        unique_gpu_caches: dict[str, torch.Tensor] = {}
-        for name, tensor in seen_ptrs.values():
-            storage = tensor.untyped_storage()
-            raw = torch.empty(0, dtype=torch.int8, device=self.device).set_(
-                storage, 0, (storage.nbytes(),)
-            )
-            el = tensor.element_size()
-            page_size_bytes = storage.nbytes() // num_blocks
-            outer_dims = [
-                d for d in range(tensor.ndim) if tensor.stride(d) * el > page_size_bytes
-            ]
-            if not outer_dims:
-                unique_gpu_caches[name] = raw.view(num_blocks, -1)
-            else:
-                seg_stride = tensor.stride(outer_dims[0]) * el
-                for idx in range(tensor.shape[outer_dims[0]]):
-                    offset = idx * seg_stride
-                    chunk = raw[offset : offset + seg_stride]
-                    unique_gpu_caches[f"{name}.{idx}"] = chunk.view(num_blocks, -1)
+        repr_kv_caches = {name: _repr_tensor(value) for name, value in kv_caches.items()}
+        unique_gpu_caches, layout_descriptor = build_gpu_cache_views(
+            repr_kv_caches,
+            num_blocks,
+            self.device,
+            mode=layout_decision.mode,
+        )
+        self.layout_descriptor = layout_descriptor
 
         # Compute per-tensor bytes_per_block. Tensors may have different
         # page_size_bytes (e.g., UniformTypeKVCacheSpecs with varying head_size).
@@ -143,10 +156,15 @@ class SimpleCPUOffloadWorker:
 
         logger.info(
             "SimpleCPUOffloadWorker: %d unique GPU KV tensors, "
-            "allocating %d CPU blocks (%.2f GB)",
+            "allocating %d CPU blocks (%.2f GB, pin_memory_fix=%s, "
+            "pin_strategy=%s, swapper_block_first=%s, cpu_layout=%s)",
             len(unique_gpu_caches),
             self.num_cpu_blocks,
             (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
+            self._pin_memory_fix,
+            "cudaHostRegister" if is_pin_memory_available() else "unpinned",
+            self._swapper_block_first,
+            self.layout_descriptor.mode,
         )
 
         pin_memory = is_pin_memory_available()
@@ -157,15 +175,31 @@ class SimpleCPUOffloadWorker:
 
         self.gpu_kv_caches = unique_gpu_caches
         self.cpu_kv_caches = {}
-        for name, gpu_tensor in unique_gpu_caches.items():
-            cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
-            # Allocate non-pinned first, then pin via cudaHostRegister to
-            # bypass PyTorch's CUDACachingHostAllocator which rounds up to
-            # the next power of 2 (e.g. 100 GB -> 128 GB).
-            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+        if self.layout_descriptor.mode == "block_first":
+            ordered_items = list(unique_gpu_caches.items())
+            block_span = sum(t.stride(0) * t.element_size() for _, t in ordered_items)
+            slab = torch.zeros((self.num_cpu_blocks, block_span), dtype=torch.int8, device="cpu")
             if pin_memory:
-                pin_tensor(tensor)
-            self.cpu_kv_caches[name] = tensor
+                pin_tensor(slab)
+            self._block_first_slab = slab
+
+            cursor = 0
+            for name, gpu_tensor in ordered_items:
+                seg_bytes = gpu_tensor.stride(0) * gpu_tensor.element_size()
+                self.cpu_kv_caches[name] = slab[:, cursor : cursor + seg_bytes]
+                cursor += seg_bytes
+            assert cursor == block_span
+        else:
+            self._block_first_slab = None
+            for name, gpu_tensor in unique_gpu_caches.items():
+                cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+                # Allocate non-pinned first, then pin via cudaHostRegister to
+                # bypass PyTorch's CUDACachingHostAllocator which rounds up to
+                # the next power of 2 (e.g. 100 GB -> 128 GB).
+                tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+                if pin_memory:
+                    pin_tensor(tensor)
+                self.cpu_kv_caches[name] = tensor
 
         # Use lowest priority so KV cache I/O yields to compute streams.
         low_pri, _ = torch.cuda.Stream.priority_range()
@@ -183,6 +217,23 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
+        if (
+            not self._reported_static_metadata_mismatch
+            and (
+                metadata.pin_memory_fix != self._pin_memory_fix
+                or metadata.swapper_block_first != self._swapper_block_first
+            )
+        ):
+            logger.warning(
+                "SimpleCPUOffloadWorker metadata/config mismatch: "
+                "metadata(pin_memory_fix=%s, swapper_block_first=%s) != "
+                "worker(pin_memory_fix=%s, swapper_block_first=%s)",
+                metadata.pin_memory_fix,
+                metadata.swapper_block_first,
+                self._pin_memory_fix,
+                self._swapper_block_first,
+            )
+            self._reported_static_metadata_mismatch = True
         if metadata.load_event >= 0:
             self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
@@ -226,6 +277,9 @@ class SimpleCPUOffloadWorker:
                     is_store=False,
                     event_idx=metadata.load_event,
                     events_list=self._load_events,
+                    localities=metadata.load_cpu_block_localities.get(
+                        metadata.load_event, []
+                    ),
                 )
             # Launch stores (GPU->CPU).
             if metadata.store_gpu_blocks:
@@ -235,6 +289,7 @@ class SimpleCPUOffloadWorker:
                     is_store=True,
                     event_idx=metadata.store_event,
                     events_list=self._store_events,
+                    localities=metadata.store_cpu_block_localities,
                 )
 
         # (2) Track completed transfer events

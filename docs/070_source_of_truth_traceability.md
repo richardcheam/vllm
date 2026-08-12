@@ -33,22 +33,24 @@ Interpretation:
 2. Read the paper semantic reference for intended behavior.
 3. Check old release code to understand shipped heuristics and shortcuts.
 4. Check modern landing-zone code and current status.
-5. If behavior differs, record a new divergence entry in
+5. For block-first/native transfer work, consult
+   `docs/090_block_first_native_design_spike.md` before editing worker/copy code.
+6. If behavior differs, record a new divergence entry in
    `docs/071_progress_decision_log.md` before changing code.
 
 ## Traceability Matrix
 
 | Area | Paper semantic source | Official SuperInfer release code | Modern landing zone | Current status |
 |---|---|---|---|---|
-| CLI/config knobs | Sec. 4.1 (system controls), Sec. 4.2/4.3 tuning knobs | `vllm/engine/arg_utils.py`, `vllm/config.py` | `vllm/engine/arg_utils.py`, `vllm/config/cache.py`, `vllm/config/scheduler.py`, `vllm/config/vllm.py` | Implemented; parsed and wired. `swap_cpu_memory_gb` now activates `SimpleCPUOffloadConnector`. |
-| RotaSched proactive policy | Sec. 4.2.1-4.2.3 (active rotation, LVF) | `vllm/v1/core/scheduler.py` (`schedule_early`) | `vllm/v1/core/sched/scheduler.py`, `vllm/v1/simple_kv_offload/manager.py` | Partially integrated: `proactive_swap_budget` drives guarded decode-tail/small-decode-backlog proactive preemption and lazy offload scan depth; victim choice uses policy fallback by default and VLT scoring when VLT/SLO knobs are enabled. |
+| CLI/config knobs | Sec. 4.1 (system controls), Sec. 4.2/4.3 tuning knobs | `vllm/engine/arg_utils.py`, `vllm/config.py` | `vllm/engine/arg_utils.py`, `vllm/config/cache.py`, `vllm/config/scheduler.py`, `vllm/config/vllm.py` | Implemented; parsed and wired. `swap_cpu_memory_gb` now activates `SimpleCPUOffloadConnector` and carries transfer flags into connector extra config. |
+| RotaSched proactive policy | Sec. 4.2.1-4.2.3 (active rotation, LVF) | `vllm/v1/core/scheduler.py` (`schedule_early`) | `vllm/v1/core/sched/scheduler.py`, `vllm/v1/simple_kv_offload/manager.py` | Partially integrated: `proactive_swap_budget` drives guarded decode-tail/small-decode-backlog proactive preemption and lazy offload scan depth; scheduler-side proactive movement can now preempt multiple guarded candidates until the configured free-block target is reached. The target accounts for immediate waiting-request block pressure above the static budget and is limited by available CPU swap capacity. Lazy offload batches budgeted movement by default; the single-request throttle remains explicit debug-only. Victim choice uses policy fallback by default and VLT scoring when VLT/SLO knobs are enabled. |
 | VLT scoring definition | Sec. 4.2.2 (VLT equation and coefficients) | No exact equation implemented; heuristic timing in scheduler | `vllm/v1/core/sched/vlt.py`, `vllm/v1/core/sched/scheduler.py`, `vllm/v1/request.py`, `vllm/v1/simple_kv_offload/manager.py` | Partially active: helper now influences guarded proactive swap victim selection when VLT/SLO knobs are non-default, consumes connector-estimated swap bandwidth when available, and uses request timing hints for TTFT/TBT terms; full policy integration still pending. |
 | Request rotary state | Sec. 4.2.1 (transient rotary state) | `RequestStatus.SWAPPED` plus timing fields in `vllm/v1/request.py` | `vllm/v1/request.py` (`RequestRotaryState`) | Metadata state machine implemented with transition guards and status sync. |
 | CPU/GPU cache movement | Sec. 4.3.2 (rotation engine + CPU tier) | `vllm/v1/core/kv_cache_manager.py` swap lists + `vllm/v1/swapper/*` | `vllm/v1/simple_kv_offload/*`, `vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py` | Using modern simple offload path as the first landing zone; debug single-request swap gate added. |
-| Duplex transfer semantics | Sec. 4.3.2 (block-first, batched copies, full-duplex overlap) | `vllm/v1/swapper/native/swapper.cpp` (`swap_block_first`, `cudaMemcpyBatchAsync`) | Existing modern offload connectors/workers | Not forward-ported yet; deferred until correctness path is stable. |
+| Duplex transfer semantics | Sec. 4.3.2 (block-first, batched copies, full-duplex overlap) | `vllm/v1/swapper/native/swapper.cpp` (`swap_block_first`, `cudaMemcpyBatchAsync`) | Existing modern offload connectors/workers | Partially advanced: modern `DmaCopyBackend` uses `cuMemcpyBatchAsync`, separate load/store CUDA streams, and now independent load/store submission queues/threads. `pin_memory_fix`/`swapper_block_first` are propagated through metadata/logging. Native block-first layout and full old DuplexKV semantics are not forward-ported yet. |
 | Scheduler/offload telemetry | Sec. 5 metrics and analysis sections | Engine observability in release fork | `vllm/v1/metrics/stats.py`, `vllm/v1/core/sched/scheduler.py`, `vllm/v1/simple_kv_offload/manager.py` | Implemented counters and tested roundtrip aggregation. |
 | Engine overlap pipeline | Sec. 4.3.2, Fig. 15 | `vllm/v1/engine/core.py` custom overlap path | Modern `vllm/v1/engine/core.py` + async scheduling | Not ported; high-risk area deferred. |
-| Prefix-cache safety fix | Mentioned in release behavior and ablation knobs | `vllm/v1/core/kv_cache_manager.py` | Modern prefix cache internals + connector flow | Initial guarded fix implemented: proactive swap candidates are excluded when allocated non-null blocks have `ref_cnt > 1`, keeping shared prefix-cache blocks pinned until refcount-aware offload is validated. |
+| Prefix-cache safety fix | Mentioned in release behavior and ablation knobs | `vllm/v1/core/kv_cache_manager.py` | Modern prefix cache internals + connector flow | Initial guarded fix implemented: proactive swap candidates are excluded when allocated non-null blocks have `ref_cnt > 1`, keeping shared prefix-cache blocks pinned. Refcount-aware shared-prefix offload remains pending because modern ownership spans multiple request block lists and cache maps. |
 
 ## Known Intentional Divergences
 
@@ -61,8 +63,14 @@ Interpretation:
 ### D-002: `swap_cpu_memory_gb` maps to modern connector, not old swapper thread
 
 - Why: modern vLLM already provides offload interfaces and lifecycle hooks.
-- Impact: allocator capacity is real; native DuplexKV path is not yet used.
+- Impact: allocator capacity is real and transfer compatibility flags are visible in connector metadata/telemetry; native DuplexKV block-first layout is not yet used.
 - Exit criteria: confirm correctness first, then evaluate whether native engine is still required.
+
+### D-006: Full-duplex transfer is implemented at submission-stream level only
+
+- Why: the modern simple offload path already has separate CUDA streams and batched copy calls, but changing CPU KV layout or native kernels is higher risk for DeepSeek-V4.
+- Impact: load/store submissions no longer share one Python queue/thread, but CPU block layout remains GPU-derived and not old SuperInfer block-first.
+- Exit criteria: benchmark under pressure and decide whether block-first layout or native C++ swapper machinery is still needed.
 
 ### D-003: Rotary state is metadata-only for now
 
@@ -73,13 +81,13 @@ Interpretation:
 ### D-004: Step-6 debug swap gate uses connector-level throttling
 
 - Why: validate swap correctness incrementally without enabling broad proactive movement.
-- Impact: when enabled, store/load planning is restricted to a single request per scheduler step.
-- Exit criteria: correctness suite proves stable resume behavior, then remove or relax gate.
+- Impact: when explicitly enabled, store/load planning is restricted to a single request per scheduler step. Proactive swap no longer enables this throttle automatically after guarded DeepSeek-V4 GPU validation.
+- Exit criteria: keep as an explicit debugging override only; do not re-enable automatically for validated proactive paths.
 
 ### D-005: Proactive budget currently controls scan depth, not full LVF victim choice
 
 - Why: activate bounded proactive movement with minimal scheduler risk while preserving modern request ordering.
-- Impact: `proactive_swap_budget` now limits lazy offload blocks per step in `SimpleCPUOffloadScheduler` and enables guarded scheduler preemption for decode-tail plus small decode-backlog requests when free GPU blocks are below budget; victim ranking can use VLT weights, with connector-estimated swap bandwidth telemetry as input when present.
+- Impact: `proactive_swap_budget` now limits lazy offload blocks per step in `SimpleCPUOffloadScheduler` and enables guarded scheduler preemption for decode-tail plus small decode-backlog requests when free GPU blocks are below budget or the head waiting request's immediate block pressure. Scheduler-side proactive movement can evict multiple guarded candidates until the configured free-block target is reached, but only while available CPU swap capacity can hold each selected candidate. Lazy offload batches budgeted movement by default unless `debug_single_request_swap` is explicitly set. Victim ranking can use VLT weights, with connector-estimated swap bandwidth telemetry as input when present.
 - Exit criteria: integrate request-level proactive victim selection across broader candidate sets and scheduling decisions with targeted preemption/resume correctness tests.
 
 ## Non-Negotiable Safety Rules for Porting

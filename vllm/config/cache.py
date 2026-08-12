@@ -180,12 +180,14 @@ class CacheConfig:
     When set, this enables the simple CPU offload connector path."""
 
     swapper_block_first: bool = False
-    """SuperInfer/GH200 no-op flag for a future block-first CPU KV layout.
-    This is parsed and stored only; it does not change KV cache layout yet."""
+    """SuperInfer/GH200 flag for a future block-first CPU KV layout.
+    This is parsed, stored, and exposed by the simple CPU offload connector;
+    it does not change KV cache layout yet."""
 
     pin_memory_fix: bool = False
-    """SuperInfer/GH200 no-op flag for a future large pinned-memory allocation
-    workaround. This is parsed and stored only."""
+    """SuperInfer/GH200 flag for the large pinned-memory allocation workaround.
+    The simple CPU offload worker already uses allocate-then-cudaHostRegister;
+    this flag is exposed for parity validation."""
 
     prefix_cache_fix: bool = False
     """SuperInfer/GH200 no-op flag for a future prefix-cache safety guard.
@@ -226,6 +228,11 @@ class CacheConfig:
             "swapper_block_first",
             "pin_memory_fix",
             "prefix_cache_fix",
+            "superinfer_high_risk_mode",
+            "gh200_topology_tuned",
+            "local_cpu_pool_fraction",
+            "local_swap_bandwidth_bytes_per_s",
+            "remote_swap_bandwidth_bytes_per_s",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -237,6 +244,25 @@ class CacheConfig:
         # convert cache_config to dict(key: str, value: str) for prometheus
         # metrics info
         return {key: str(value) for key, value in self.__dict__.items()}
+
+    superinfer_high_risk_mode: bool = False
+    """Enable aggressive SuperInfer behavior for maximum throughput.
+
+    This mode intentionally relaxes conservative safety gates in scheduler and
+    offload layout decisions to prioritize throughput exploration.
+    """
+
+    gh200_topology_tuned: bool = False
+    """Enable GH200 locality-aware offload skeleton (non-default)."""
+
+    local_cpu_pool_fraction: float = Field(default=0.75, ge=0.0, le=1.0)
+    """Fraction of logical CPU swap pool treated as local-first."""
+
+    local_swap_bandwidth_bytes_per_s: float = Field(default=float(900 * (1024**3)), gt=0)
+    """Estimated local CPU<->GPU swap bandwidth used for locality cost hints."""
+
+    remote_swap_bandwidth_bytes_per_s: float = Field(default=float(280 * (1024**3)), gt=0)
+    """Estimated remote CPU<->GPU swap bandwidth used for locality cost hints."""
 
     _block_size_resolved: bool = field(default=False, init=False)
     """Guard against pydantic re-running _apply_block_size_default."""
