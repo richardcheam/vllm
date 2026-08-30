@@ -223,6 +223,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.startup_diagnostics import startup_phase_decorator
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -5242,6 +5243,7 @@ class GPUModelRunner(
             setattr(self, config_name, new_config)
 
     @instrument(span_name="Loading (GPU)")
+    @startup_phase_decorator("model_runner.model_loading")
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """
         Args:
@@ -6573,6 +6575,7 @@ class GPUModelRunner(
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
     @torch.inference_mode()
+    @startup_phase_decorator("model_runner.cuda_graph_memory_profiling")
     def profile_cudagraph_memory(self) -> int:
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
@@ -6742,6 +6745,7 @@ class GPUModelRunner(
         return int(total_estimate)
 
     @instrument(span_name="Capture model")
+    @startup_phase_decorator("model_runner.cuda_graph_capture")
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(

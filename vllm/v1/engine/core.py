@@ -85,6 +85,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
+from vllm.v1.worker.startup_diagnostics import startup_phase_decorator
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -240,6 +241,7 @@ class EngineCore:
         enable_envs_cache()
 
     @instrument(span_name="Prepare model")
+    @startup_phase_decorator("engine.kv_cache_initialization")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
 

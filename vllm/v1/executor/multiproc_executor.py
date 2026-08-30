@@ -62,6 +62,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.worker.startup_diagnostics import startup_phase_decorator
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -594,6 +595,7 @@ class WorkerProc:
             )
 
     @instrument(span_name="Worker init")
+    @startup_phase_decorator("worker_process.initialization")
     def __init__(
         self,
         vllm_config: VllmConfig,

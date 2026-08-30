@@ -724,7 +724,23 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    swap_cpu_memory_gb: float | None = CacheConfig.swap_cpu_memory_gb
+    cpu_kv_allocation_mode: str = CacheConfig.cpu_kv_allocation_mode
+    swapper_block_first: bool = CacheConfig.swapper_block_first
+    pin_memory_fix: bool = CacheConfig.pin_memory_fix
+    superinfer_high_risk_mode: bool = CacheConfig.superinfer_high_risk_mode
+    gh200_topology_tuned: bool = CacheConfig.gh200_topology_tuned
+    local_cpu_pool_fraction: float = CacheConfig.local_cpu_pool_fraction
+    local_swap_bandwidth_bytes_per_s: float = CacheConfig.local_swap_bandwidth_bytes_per_s
+    remote_swap_bandwidth_bytes_per_s: float = CacheConfig.remote_swap_bandwidth_bytes_per_s
     tokens_only: bool = False
+
+    proactive_swap_budget: int = SchedulerConfig.proactive_swap_budget
+    vlt_alpha: float = SchedulerConfig.vlt_alpha
+    vlt_beta_bandwidth: float = SchedulerConfig.vlt_beta_bandwidth
+    vlt_beta_future: float = SchedulerConfig.vlt_beta_future
+    slo_ttft: float | None = SchedulerConfig.slo_ttft
+    slo_tbt: float | None = SchedulerConfig.slo_tbt
 
     shutdown_timeout: int = 0
 
@@ -1209,6 +1225,37 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+        cache_group.add_argument(
+            "--swap-cpu-memory-gb", **cache_kwargs["swap_cpu_memory_gb"]
+        )
+        cache_group.add_argument(
+            "--cpu-kv-allocation-mode", **cache_kwargs["cpu_kv_allocation_mode"]
+        )
+        cache_group.add_argument(
+            "--swapper-block-first", **cache_kwargs["swapper_block_first"]
+        )
+        cache_group.add_argument("--pin-memory-fix", **cache_kwargs["pin_memory_fix"])
+        cache_group.add_argument(
+            "--superinfer-high-risk-mode",
+            **cache_kwargs["superinfer_high_risk_mode"],
+        )
+        cache_group.add_argument(
+            "--native-copy-backend", **cache_kwargs["native_copy_backend"]
+        )
+        cache_group.add_argument(
+            "--gh200-topology-tuned", **cache_kwargs["gh200_topology_tuned"]
+        )
+        cache_group.add_argument(
+            "--local-cpu-pool-fraction", **cache_kwargs["local_cpu_pool_fraction"]
+        )
+        cache_group.add_argument(
+            "--local-swap-bandwidth-bytes-per-s",
+            **cache_kwargs["local_swap_bandwidth_bytes_per_s"],
+        )
+        cache_group.add_argument(
+            "--remote-swap-bandwidth-bytes-per-s",
+            **cache_kwargs["remote_swap_bandwidth_bytes_per_s"],
+        )
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -1478,6 +1525,18 @@ class EngineArgs:
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
         )
+        scheduler_group.add_argument(
+            "--proactive-swap-budget", **scheduler_kwargs["proactive_swap_budget"]
+        )
+        scheduler_group.add_argument("--vlt-alpha", **scheduler_kwargs["vlt_alpha"])
+        scheduler_group.add_argument(
+            "--vlt-beta-bandwidth", **scheduler_kwargs["vlt_beta_bandwidth"]
+        )
+        scheduler_group.add_argument(
+            "--vlt-beta-future", **scheduler_kwargs["vlt_beta_future"]
+        )
+        scheduler_group.add_argument("--slo-ttft", **scheduler_kwargs["slo_ttft"])
+        scheduler_group.add_argument("--slo-tbt", **scheduler_kwargs["slo_tbt"])
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
@@ -1921,6 +1980,15 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            swap_cpu_memory_gb=self.swap_cpu_memory_gb,
+            cpu_kv_allocation_mode=self.cpu_kv_allocation_mode,
+            swapper_block_first=self.swapper_block_first,
+            pin_memory_fix=self.pin_memory_fix,
+            superinfer_high_risk_mode=self.superinfer_high_risk_mode,
+            gh200_topology_tuned=self.gh200_topology_tuned,
+            local_cpu_pool_fraction=self.local_cpu_pool_fraction,
+            local_swap_bandwidth_bytes_per_s=self.local_swap_bandwidth_bytes_per_s,
+            remote_swap_bandwidth_bytes_per_s=self.remote_swap_bandwidth_bytes_per_s,
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):
@@ -2199,6 +2267,12 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            proactive_swap_budget=self.proactive_swap_budget,
+            vlt_alpha=self.vlt_alpha,
+            vlt_beta_bandwidth=self.vlt_beta_bandwidth,
+            vlt_beta_future=self.vlt_beta_future,
+            slo_ttft=self.slo_ttft,
+            slo_tbt=self.slo_tbt,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

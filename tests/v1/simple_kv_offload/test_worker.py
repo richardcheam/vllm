@@ -19,7 +19,7 @@ from vllm.platforms import current_platform
 if not current_platform.is_cuda_alike():
     pytest.skip("Requires CUDA or ROCm", allow_module_level=True)
 
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.copy_backend import CopyBackendError, DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
     CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
@@ -124,6 +124,7 @@ def test_store_orders_after_compute_write():
     assert fixed == 0, f"store raced compute even with the barrier: {fixed} corrupt"
 
 
+
 class _RecordingBackend:
     """Captures launch_copy calls without touching the GPU."""
 
@@ -141,9 +142,12 @@ class _RecordingBackend:
     ) -> None:
         self.calls.append({"is_store": is_store, "wait_event": wait_event})
 
+    def raise_if_failed(self):
+        return
+
 
 def test_get_finished_passes_wait_event_for_store_only():
-    """get_finished gates stores on a compute-done event but not loads."""
+    """Loads submit before forward while stores remain compute-gated."""
     worker = SimpleCPUOffloadWorker(
         vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
     )
@@ -158,6 +162,7 @@ def test_get_finished_passes_wait_event_for_store_only():
         store_cpu_blocks=[1],
     )
 
+    worker.start_load_kv()
     worker.get_finished(set())
 
     store_calls = [c for c in recording.calls if c["is_store"]]
@@ -166,6 +171,63 @@ def test_get_finished_passes_wait_event_for_store_only():
     assert len(load_calls) == 1
     assert isinstance(store_calls[0]["wait_event"], torch.Event)
     assert load_calls[0]["wait_event"] is None
+
+
+def test_start_load_kv_does_not_submit_same_event_twice():
+    """Repeated pre-forward hooks do not duplicate an H2D load."""
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    )
+    recording = _RecordingBackend()
+    worker._backend = recording
+    worker._connector_metadata = SimpleCPUOffloadMetadata(
+        load_event=3,
+        load_gpu_blocks=[0],
+        load_cpu_blocks=[0],
+    )
+
+    worker.start_load_kv()
+    worker.start_load_kv()
+
+    load_calls = [c for c in recording.calls if not c["is_store"]]
+    assert len(load_calls) == 1
+
+
+def test_each_store_submission_owns_compute_event():
+    """Consecutive store submissions must not reuse a wait event."""
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    )
+    recording = _RecordingBackend()
+    worker._backend = recording
+
+    for event_idx in (1, 2):
+        worker._connector_metadata = SimpleCPUOffloadMetadata(
+            store_event=event_idx,
+            store_gpu_blocks=[event_idx],
+            store_cpu_blocks=[event_idx],
+        )
+        worker.get_finished(set())
+
+    store_calls = [c for c in recording.calls if c["is_store"]]
+    assert len(store_calls) == 2
+    assert store_calls[0]["wait_event"] is not store_calls[1]["wait_event"]
+
+
+class _FailedBackend(_RecordingBackend):
+    def raise_if_failed(self):
+        raise CopyBackendError("copy failed")
+
+
+def test_copy_backend_failure_is_checked_before_submission():
+    """Worker surfaces a background copy failure on its next step."""
+    worker = SimpleCPUOffloadWorker(
+        vllm_config=None, kv_cache_config=None, cpu_capacity_bytes=0
+    )
+    worker._backend = _FailedBackend()
+
+    with pytest.raises(CopyBackendError, match="copy failed"):
+        worker.get_finished(set())
 
 
 def test_build_params_src_access_order():

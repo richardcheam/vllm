@@ -75,6 +75,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.startup_diagnostics import startup_phase_decorator
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -294,6 +295,7 @@ class Worker(WorkerBase):
             torch._C._accelerator_setAllocatorSettings(f"max_split_size_mb:{restore}")
 
     @instrument(span_name="Init device")
+    @startup_phase_decorator("worker.device_initialization")
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
@@ -421,6 +423,7 @@ class Worker(WorkerBase):
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    @startup_phase_decorator("worker.model_loading")
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
@@ -445,6 +448,7 @@ class Worker(WorkerBase):
         self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
+    @startup_phase_decorator("worker.memory_profiling")
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -714,6 +718,7 @@ class Worker(WorkerBase):
         logger.debug("Updated max_model_len to %d", max_model_len)
 
     @instrument(span_name="Allocate KV cache")
+    @startup_phase_decorator("worker.kv_cache_initialization")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
@@ -743,6 +748,7 @@ class Worker(WorkerBase):
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
+    @startup_phase_decorator("worker.warmup_and_graph_capture")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 

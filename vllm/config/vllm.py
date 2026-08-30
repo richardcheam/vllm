@@ -860,6 +860,43 @@ class VllmConfig:
         Right now, this function reads the offloading settings from
         CacheConfig and configures the KVTransferConfig accordingly.
         """
+        if self.cache_config.swap_cpu_memory_gb is not None:
+            if self.cache_config.swap_cpu_memory_gb <= 0:
+                raise ValueError("swap_cpu_memory_gb must be > 0 when provided")
+
+            if self.kv_transfer_config is None:
+                self.kv_transfer_config = KVTransferConfig()
+
+            self.kv_transfer_config.kv_connector = "SimpleCPUOffloadConnector"
+            extra_config = self.kv_transfer_config.kv_connector_extra_config
+            extra_config.update(
+                {
+                    "cpu_bytes_to_use": self.cache_config.swap_cpu_memory_gb
+                    * (1 << 30),
+                    "cpu_kv_allocation_mode": self.cache_config.cpu_kv_allocation_mode,
+                    "lazy_offload": True,
+                    "pin_memory_fix": self.cache_config.pin_memory_fix,
+                    "swapper_block_first": self.cache_config.swapper_block_first,
+                    "superinfer_high_risk_mode": (
+                        self.cache_config.superinfer_high_risk_mode
+                    ),
+                    "native_copy_backend": self.cache_config.native_copy_backend,
+                    "gh200_topology_tuned": self.cache_config.gh200_topology_tuned,
+                    "local_cpu_pool_fraction": self.cache_config.local_cpu_pool_fraction,
+                    "local_swap_bandwidth_bytes_per_s": (
+                        self.cache_config.local_swap_bandwidth_bytes_per_s
+                    ),
+                    "remote_swap_bandwidth_bytes_per_s": (
+                        self.cache_config.remote_swap_bandwidth_bytes_per_s
+                    ),
+                }
+            )
+            extra_config.setdefault("debug_single_request_swap", False)
+            extra_config.setdefault("min_lazy_store_batch_blocks", 2)
+            extra_config.setdefault("transfer_queue_depth", 8)
+            self.kv_transfer_config.kv_role = "kv_both"
+            return
+
         # KV offloading is only activated when kv_offloading_size is set.
         if (kv_offloading_size := self.cache_config.kv_offloading_size) is None:
             return

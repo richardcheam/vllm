@@ -188,6 +188,40 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    swap_cpu_memory_gb: float | None = None
+    """SuperInfer CPU DRAM KV swap budget in GiB."""
+
+    cpu_kv_allocation_mode: Literal["zero", "empty"] = "zero"
+    """CPU KV allocation mode; ``empty`` skips unnecessary zero-fill."""
+
+    swapper_block_first: bool = False
+    """Enable the SuperInfer block-first CPU KV swap mode."""
+
+    pin_memory_fix: bool = False
+    """Enable the SuperInfer pinned-memory allocation workaround."""
+
+    superinfer_high_risk_mode: bool = False
+    """Enable aggressive SuperInfer scheduling and offload behavior."""
+
+    native_copy_backend: bool = False
+    """Use the optional native CUDA batch-copy submission backend."""
+
+    gh200_topology_tuned: bool = False
+    """Enable GH200 locality-aware offload behavior."""
+
+    local_cpu_pool_fraction: float = Field(default=0.75, ge=0.0, le=1.0)
+    """Fraction of the CPU swap pool treated as local-first."""
+
+    local_swap_bandwidth_bytes_per_s: float = Field(
+        default=float(900 * (1024**3)), gt=0
+    )
+    """Estimated local CPU-to-GPU swap bandwidth."""
+
+    remote_swap_bandwidth_bytes_per_s: float = Field(
+        default=float(280 * (1024**3)), gt=0
+    )
+    """Estimated remote CPU-to-GPU swap bandwidth."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -222,6 +256,17 @@ class CacheConfig:
             "kv_cache_max_concurrency",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # SuperInfer runtime knobs do not affect compiled graph shape.
+            "swap_cpu_memory_gb",
+            "cpu_kv_allocation_mode",
+            "swapper_block_first",
+            "pin_memory_fix",
+            "superinfer_high_risk_mode",
+            "native_copy_backend",
+            "gh200_topology_tuned",
+            "local_cpu_pool_fraction",
+            "local_swap_bandwidth_bytes_per_s",
+            "remote_swap_bandwidth_bytes_per_s",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

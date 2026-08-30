@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -53,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.vlt import VLTInputs, compute_vlt_score
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -201,6 +203,14 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # Proactive swapping is deliberately opt-in and remains conservative
+        # unless the explicit high-risk cache setting is enabled.
+        self._superinfer_high_risk_mode = bool(
+            getattr(self.cache_config, "superinfer_high_risk_mode", False)
+        )
+        self._proactive_preempt_cooldown_s = 0.05
+        self._proactive_last_preempted_at: dict[str, float] = {}
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -460,6 +470,17 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        proactive_preempted_req_ids: set[str] = set()
+        preempted_during_running_loop = False
+        proactive_preempted_reqs = self._maybe_preempt_for_proactive_swap(
+            scheduled_timestamp
+        )
+        if proactive_preempted_reqs:
+            preempted_reqs.extend(proactive_preempted_reqs)
+            proactive_preempted_req_ids.update(
+                request.request_id for request in proactive_preempted_reqs
+            )
+
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
         defer_prefills = (
@@ -601,6 +622,7 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
+                    preempted_during_running_loop = True
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -663,7 +685,10 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            (not preempted_reqs or not preempted_during_running_loop)
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -678,6 +703,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if request_id in proactive_preempted_req_ids:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1208,6 +1238,305 @@ class Scheduler(SchedulerInterface):
             skip.clear()
 
         return new_block_ids_to_zero or None
+
+    def _is_proactive_swap_candidate(self, request: Request) -> bool:
+        if request.status != RequestStatus.RUNNING:
+            return False
+        if self._estimate_request_owned_swap_blocks(request) <= 0:
+            return False
+
+        speculative_config = self.vllm_config.speculative_config
+        is_dspark = bool(
+            speculative_config is not None
+            and getattr(speculative_config, "use_dspark", lambda: False)()
+        )
+        if not self._superinfer_high_risk_mode and (
+            is_dspark
+            or request.is_prefill_chunk
+            or request.num_output_placeholders > 0
+            or request.spec_token_ids
+            or self._has_shared_kv_cache_blocks(request)
+            or getattr(request, "shared_prefix_boundary", 0) > 0
+        ):
+            return False
+
+        last_preempted_at = self._proactive_last_preempted_at.get(request.request_id)
+        if (
+            not self._superinfer_high_risk_mode
+            and last_preempted_at is not None
+            and time.monotonic() - last_preempted_at < self._proactive_preempt_cooldown_s
+        ):
+            return False
+
+        remaining_tokens = request.num_tokens - request.num_computed_tokens
+        if remaining_tokens <= 0:
+            return False
+        if not self._superinfer_high_risk_mode:
+            # Only evict requests near a stable decode boundary. This avoids
+            # moving active prefill tails and output-token bookkeeping.
+            if request.num_output_tokens == 0:
+                return False
+            if remaining_tokens > 2 * self.block_size:
+                return False
+        return True
+
+    def _request_blocks(self, request: Request):
+        try:
+            return self.kv_cache_manager.get_blocks(request.request_id).blocks
+        except KeyError:
+            return ()
+
+    def _has_shared_kv_cache_blocks(self, request: Request) -> bool:
+        return any(
+            block.ref_cnt > 1 and not block.is_null
+            for group in self._request_blocks(request)
+            for block in group
+        )
+
+    def _estimate_request_owned_swap_blocks(self, request: Request) -> int:
+        return sum(
+            1
+            for group in self._request_blocks(request)
+            for block in group
+            if block.block_hash is not None
+            and not block.is_null
+            and block.ref_cnt <= 1
+        )
+
+    def _estimate_request_cpu_resident_blocks(self, request: Request) -> int:
+        get_resident = getattr(
+            self.connector, "get_num_cpu_resident_owned_blocks", None
+        )
+        if not callable(get_resident):
+            get_resident = getattr(self.connector, "get_num_cpu_resident_blocks", None)
+        if not callable(get_resident):
+            return 0
+
+        resident_blocks = get_resident(request)
+        if not isinstance(resident_blocks, int) or resident_blocks <= 0:
+            return 0
+        return min(resident_blocks, self._estimate_request_owned_swap_blocks(request))
+
+    def _estimate_request_unsynced_swap_blocks(self, request: Request) -> int:
+        return max(
+            self._estimate_request_owned_swap_blocks(request)
+            - self._estimate_request_cpu_resident_blocks(request),
+            0,
+        )
+
+    def _estimate_request_swap_bytes(self, request: Request) -> int:
+        num_blocks = self._estimate_request_unsynced_swap_blocks(request)
+        num_cache_blocks = self.kv_cache_config.num_blocks
+        if num_blocks <= 0 or num_cache_blocks <= 0:
+            return 0
+        bytes_per_block = sum(
+            tensor.size for tensor in self.kv_cache_config.kv_cache_tensors
+        ) // num_cache_blocks
+        return num_blocks * bytes_per_block
+
+    def _estimate_request_remote_penalty(self, request: Request) -> float:
+        estimate = getattr(
+            self.connector, "estimate_request_remote_penalty_seconds", None
+        )
+        if not callable(estimate):
+            return 0.0
+        penalty = estimate(request)
+        return max(float(penalty), 0.0) if isinstance(penalty, (int, float)) else 0.0
+
+    def _estimate_waiting_block_pressure(self) -> int:
+        requests = []
+        if self.waiting:
+            requests.append(self.waiting.peek_request())
+        if self.skipped_waiting:
+            requests.append(self.skipped_waiting.peek_request())
+        if not requests:
+            return 0
+        return max(
+            self._estimate_request_immediate_block_pressure(request)
+            for request in requests
+        )
+
+    def _estimate_request_immediate_block_pressure(self, request: Request) -> int:
+        remaining_tokens = request.num_tokens - request.num_computed_tokens
+        if remaining_tokens <= 0:
+            return 0
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if threshold > 0:
+            remaining_tokens = min(remaining_tokens, threshold)
+        return math.ceil(
+            min(remaining_tokens, self.max_num_scheduled_tokens) / self.block_size
+        )
+
+    def _estimate_cpu_pressure_ratio(self) -> float | None:
+        get_free = getattr(self.connector, "get_num_free_cpu_blocks", None)
+        get_total = getattr(self.connector, "get_num_total_cpu_blocks", None)
+        if not callable(get_free) or not callable(get_total):
+            return None
+        free_blocks, total_blocks = get_free(), get_total()
+        if (
+            not isinstance(free_blocks, int)
+            or not isinstance(total_blocks, int)
+            or total_blocks <= 0
+        ):
+            return None
+        return min(max((total_blocks - max(free_blocks, 0)) / total_blocks, 0.0), 1.0)
+
+    def _select_proactive_swap_victim(self, candidates: list[Request]) -> Request:
+        use_vlt = any(
+            (
+                getattr(self.scheduler_config, "vlt_alpha", 0.0),
+                getattr(self.scheduler_config, "vlt_beta_bandwidth", 0.0),
+                getattr(self.scheduler_config, "vlt_beta_future", 0.0),
+                getattr(self.scheduler_config, "slo_ttft", None),
+                getattr(self.scheduler_config, "slo_tbt", None),
+            )
+        )
+        if not use_vlt:
+            if self.policy == SchedulingPolicy.PRIORITY:
+                return max(candidates, key=lambda request: (
+                    request.priority,
+                    request.arrival_time,
+                ))
+            return candidates[-1]
+
+        get_bandwidth = getattr(
+            self.connector, "get_estimated_swap_bandwidth_bytes_per_s", None
+        )
+        bandwidth = get_bandwidth() if callable(get_bandwidth) else None
+        if not isinstance(bandwidth, (int, float)) or bandwidth <= 0:
+            bandwidth = 50 * (1024**3)
+
+        now = time.time()
+        scored: list[tuple[float, tuple, Request]] = []
+        for index, request in enumerate(candidates):
+            time_in_system = max(now - request.arrival_time, 0.0)
+            first_token_ts = getattr(request, "first_generated_token_ts", None)
+            last_token_ts = getattr(request, "last_generated_token_ts", None)
+            output_tokens = request.num_output_tokens
+            predicted_ttft = (
+                max(first_token_ts - request.arrival_time, 0.0)
+                if first_token_ts is not None
+                else time_in_system
+            )
+            predicted_tbt = None
+            if (
+                output_tokens > 1
+                and first_token_ts is not None
+                and last_token_ts is not None
+            ):
+                predicted_tbt = max(last_token_ts - first_token_ts, 0.0) / (
+                    output_tokens - 1
+                )
+            elif output_tokens > 0:
+                predicted_tbt = time_in_system / output_tokens
+
+            inputs = VLTInputs(
+                predicted_ttft_s=predicted_ttft,
+                predicted_tbt_s=predicted_tbt,
+                predicted_future_delay_s=(
+                    time_in_system + self._estimate_request_remote_penalty(request)
+                ),
+                swap_bytes=self._estimate_request_swap_bytes(request),
+                swap_bandwidth_bytes_per_s=float(bandwidth),
+            )
+            score = compute_vlt_score(
+                inputs,
+                alpha=getattr(self.scheduler_config, "vlt_alpha", 0.0),
+                beta_bandwidth=getattr(
+                    self.scheduler_config, "vlt_beta_bandwidth", 0.0
+                ),
+                beta_future=getattr(self.scheduler_config, "vlt_beta_future", 0.0),
+                slo_ttft=getattr(self.scheduler_config, "slo_ttft", None),
+                slo_tbt=getattr(self.scheduler_config, "slo_tbt", None),
+            )
+            tie_break = (
+                request.priority,
+                request.arrival_time,
+                index,
+            )
+            scored.append((score, tie_break, request))
+        return min(scored, key=lambda item: (item[0], item[1]))[2]
+
+    def _maybe_preempt_for_proactive_swap(self, timestamp: float) -> list[Request]:
+        budget = getattr(self.scheduler_config, "proactive_swap_budget", 0)
+        if budget <= 0 or self._pause_state != PauseState.UNPAUSED:
+            return []
+        if not self.waiting and not self.skipped_waiting:
+            return []
+
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            not self._superinfer_high_risk_mode
+            and speculative_config is not None
+            and getattr(speculative_config, "use_dspark", lambda: False)()
+        ):
+            # Normal DSpark mode is excluded from proactive rotation below.
+            # Avoid scanning every running request when no safe DSpark victim
+            # can be selected; KV offload still remains available on allocator
+            # pressure and through the regular connector path.
+            return []
+
+        kv_config = self.vllm_config.kv_transfer_config
+        if kv_config is None or kv_config.kv_connector != "SimpleCPUOffloadConnector":
+            return []
+        extra_config = kv_config.kv_connector_extra_config or {}
+        if not bool(extra_config.get("lazy_offload", False)) or self.connector is None:
+            return []
+
+        has_pending = getattr(self.connector, "has_pending_transfers", None)
+        if callable(has_pending) and has_pending():
+            return []
+        if not self._superinfer_high_risk_mode:
+            pressure = self._estimate_cpu_pressure_ratio()
+            if pressure is not None and pressure >= 0.95:
+                return []
+
+        watermark_blocks = getattr(self.kv_cache_manager, "watermark_blocks", 0)
+        target_free = max(
+            int(budget), self._estimate_waiting_block_pressure(), watermark_blocks
+        )
+        target_free = min(
+            target_free, max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0)
+        )
+        if target_free <= 0 or (
+            self.kv_cache_manager.block_pool.get_num_free_blocks() >= target_free
+        ):
+            return []
+
+        get_cpu_free = getattr(self.connector, "get_num_free_cpu_blocks", None)
+        cpu_free_blocks = get_cpu_free() if callable(get_cpu_free) else None
+        if not isinstance(cpu_free_blocks, int):
+            cpu_free_blocks = None
+
+        preempted: list[Request] = []
+        rotated_blocks = 0
+        while self.kv_cache_manager.block_pool.get_num_free_blocks() < target_free:
+            if rotated_blocks >= int(budget):
+                break
+            candidates = [
+                request
+                for request in self.running
+                if self._is_proactive_swap_candidate(request)
+                and (
+                    cpu_free_blocks is None
+                    or self._estimate_request_unsynced_swap_blocks(request)
+                    <= cpu_free_blocks
+                )
+            ]
+            if not candidates:
+                break
+
+            victim = self._select_proactive_swap_victim(candidates)
+            unsynced_blocks = self._estimate_request_unsynced_swap_blocks(victim)
+            rotated_blocks += max(unsynced_blocks, 1)
+            if cpu_free_blocks is not None:
+                cpu_free_blocks -= unsynced_blocks
+            self.running.remove(victim)
+            self._preempt_request(victim, timestamp)
+            self._proactive_last_preempted_at[victim.request_id] = time.monotonic()
+            preempted.append(victim)
+
+        return preempted
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

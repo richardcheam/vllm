@@ -166,6 +166,24 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    proactive_swap_budget: int = Field(default=0, ge=0)
+    """SuperInfer proactive offload scan budget in blocks."""
+
+    vlt_alpha: float = Field(default=0.0, ge=0.0)
+    """SuperInfer VLT TBT sensitivity weight."""
+
+    vlt_beta_bandwidth: float = 0.0
+    """SuperInfer VLT swap-bandwidth weight."""
+
+    vlt_beta_future: float = 0.0
+    """SuperInfer VLT future-delay weight."""
+
+    slo_ttft: float | None = Field(default=None, gt=0.0)
+    """SuperInfer TTFT SLO in seconds."""
+
+    slo_tbt: float | None = Field(default=None, gt=0.0)
+    """SuperInfer TBT SLO in seconds."""
+
     @staticmethod
     def default_factory(**kwargs):
         """

@@ -217,6 +217,7 @@ def make_scheduler_output(
     *,
     new_reqs: dict[str, tuple[list[int], ...]] | None = None,
     cached_req_new_blocks: dict[str, tuple[list[int], ...] | None] | None = None,
+    finished_req_ids: set[str] | None = None,
 ) -> SchedulerOutput:
     """Build a minimal SchedulerOutput with num_scheduled_tokens.
 
@@ -267,7 +268,7 @@ def make_scheduler_output(
         scheduled_encoder_inputs={},
         num_common_prefix_blocks=[],
         preempted_req_ids=set(),
-        finished_req_ids=set(),
+        finished_req_ids=finished_req_ids or set(),
         free_encoder_mm_hashes=[],
     )
 
@@ -296,6 +297,34 @@ def simulate_load_completion(
         finished_recving=req_ids,
     )
     scheduler.update_connector_output(output)
+
+
+def test_lazy_store_admission_is_bounded_by_transfer_queue_depth() -> None:
+    """Allow multiple lazy stores, but never beyond the configured queue cap."""
+    fixture = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=True)
+    scheduler = fixture.scheduler
+    scheduler._transfer_queue_depth = 2
+
+    assert scheduler._store_transfer_capacity_available() is True
+    scheduler._store_event_to_blocks = {0: object(), 1: object()}
+    assert scheduler.has_pending_store_transfers() is True
+    assert scheduler._store_transfer_capacity_available() is False
+
+
+def test_speculative_boundary_bookkeeping_does_not_admit_rotation() -> None:
+    fixture = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=True)
+    scheduler = fixture.scheduler
+
+    scheduler.record_speculative_boundary(
+        "req-boundary", accepted_tokens=64, dirty_tail_tokens=8
+    )
+
+    assert scheduler.speculative_boundary_snapshot() == {
+        "requests": 1,
+        "accepted_tokens": 64,
+        "dirty_tail_tokens": 8,
+    }
+    assert scheduler._store_transfer_capacity_available() is True
 
 
 def get_cpu_free_blocks(scheduler: SimpleCPUOffloadScheduler) -> int:
@@ -410,6 +439,35 @@ def test_eager_store_and_load_roundtrip() -> None:
     assert len(meta2.load_cpu_blocks) == len(meta2.load_gpu_blocks)
 
 
+def test_store_preserves_gpu_block_hash_aliases() -> None:
+    """A physical CPU block remains discoverable through every group hash."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    gpu_block_id = kv_blocks.get_block_ids()[0][0]
+    alias = make_block_hash_with_group_id(req.block_hashes[0], 1)
+    fix.gpu_block_pool.cached_block_hashes_by_block.setdefault(
+        gpu_block_id, set()
+    ).add(alias)
+
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 2 * BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    assert meta.store_event >= 0
+    simulate_store_completion(sched, meta.store_event)
+
+    assert (
+        sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(alias)
+        is not None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 1b: Boundary — max_hit_len cap drops the last full block when the
 # prompt is an exact multiple of BLOCK_SIZE.
@@ -445,6 +503,54 @@ def test_max_hit_len_cap_drops_last_full_block() -> None:
     )
     hit_tokens, _ = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
     assert hit_tokens == (num_blocks - 1) * BLOCK_SIZE
+
+
+def test_hybrid_per_group_lookup_recovers_common_prefix(monkeypatch) -> None:
+    """A zero hybrid aggregate hit may recover from common per-group hits."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 2 * BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    simulate_store_completion(sched, meta.store_event)
+
+    req2 = Request(
+        request_id="req-hybrid-fallback",
+        prompt_token_ids=req.prompt_token_ids,
+        sampling_params=req.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=req._block_hasher,
+    )
+    cached = sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+        make_block_hash_with_group_id(req.block_hashes[0], 0)
+    )
+    assert cached is not None
+
+    monkeypatch.setattr(
+        sched.cpu_coordinator,
+        "find_longest_cache_hit",
+        lambda *_args, **_kwargs: (([],), 0, 0),
+    )
+    monkeypatch.setattr(
+        sched.cpu_coordinator,
+        "find_longest_cache_hit_per_group",
+        lambda *_args, **_kwargs: (([cached],), (BLOCK_SIZE,)),
+        raising=False,
+    )
+
+    hit_tokens, is_async = sched.get_num_new_matched_tokens(
+        req2, num_computed_tokens=0
+    )
+    assert hit_tokens == BLOCK_SIZE
+    assert is_async is True
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +637,23 @@ def test_lazy_store_and_load_roundtrip() -> None:
     meta2 = sched.build_connector_meta(sched_out2)
     assert meta2.load_event >= 0, "Expected a load event to be assigned"
     assert len(meta2.load_gpu_blocks) > 0
+
+
+def test_lazy_block_tracking_derives_group_hash_aliases() -> None:
+    """Lazy tracking records request-derived aliases before the scan."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=True)
+    sched = fix.scheduler
+    req = make_request(num_blocks=2)
+    blocks = _allocate_gpu_blocks(fix.gpu_block_pool, req, 2, group_id=0)
+
+    sched._record_gpu_blocks(
+        req.request_id,
+        ([block.block_id for block in blocks],),
+        request=req,
+    )
+
+    aliases = sched._gpu_block_hash_aliases[blocks[0].block_id]
+    assert make_block_hash_with_group_id(req.block_hashes[0], 0) in aliases
 
 
 # ---------------------------------------------------------------------------
@@ -919,6 +1042,47 @@ def test_preemption_no_cpu_block_leak() -> None:
     # Now simulate load completion -> cleanup fires
     simulate_load_completion(sched, {req2.request_id})
     assert req2.request_id not in sched._reqs_to_load
+
+
+def test_finished_request_flushes_confirmed_final_block() -> None:
+    """Finished requests still submit their last confirmed full block."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    block_ids = kv_blocks.get_block_ids()
+
+    first = make_scheduler_output(
+        {req.request_id: 2 * BLOCK_SIZE},
+        new_reqs={req.request_id: block_ids},
+        finished_req_ids={req.request_id},
+    )
+    meta = sched.build_connector_meta(first)
+
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 2
+
+
+def test_lazy_finished_request_can_flush_confirmed_blocks_without_watermark() -> None:
+    """Lazy mode must retain finished blocks long enough to offload them."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=True)
+    sched = fix.scheduler
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    block_ids = kv_blocks.get_block_ids()
+    sched.request_finished(req, block_ids=block_ids[0])
+    assert req.request_id in sched._reqs_to_store
+
+    output = make_scheduler_output(
+        {},
+        finished_req_ids={req.request_id},
+    )
+    meta = sched.build_connector_meta(output)
+
+    assert meta.store_event >= 0
+    assert len(meta.store_gpu_blocks) == 2
 
 
 # ---------------------------------------------------------------------------

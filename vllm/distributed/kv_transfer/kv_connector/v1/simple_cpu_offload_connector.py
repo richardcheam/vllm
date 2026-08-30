@@ -3,6 +3,7 @@
 """SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,6 +15,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    PromMetric,
+    PromMetricT,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -40,6 +47,167 @@ logger = init_logger(__name__)
 
 # Default CPU capacity: 8 GB
 DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
+
+_COUNTER_TELEMETRY_KEYS = frozenset(
+    {
+        "offload_store_events",
+        "offload_load_events",
+        "offload_store_blocks",
+        "offload_load_blocks",
+        "offload_store_bytes",
+        "offload_load_bytes",
+        "offload_store_events_ge_16_blocks",
+        "offload_store_events_lt_4_blocks",
+        "offload_load_events_ge_16_blocks",
+        "offload_load_events_lt_4_blocks",
+        "local_swap_out_bytes",
+        "local_swap_in_bytes",
+        "remote_swap_out_bytes",
+        "remote_swap_in_bytes",
+        "num_remote_fallbacks",
+        "swap_out_time_ms",
+        "swap_in_time_ms",
+        "local_swap_out_time_ms",
+        "local_swap_in_time_ms",
+        "remote_swap_out_time_ms",
+        "remote_swap_in_time_ms",
+        "offload_cpu_lookup_requests",
+        "offload_cpu_lookup_hits",
+        "offload_cpu_lookup_hit_tokens",
+        "offload_load_requests_created",
+        "offload_load_events_assigned",
+        "offload_speculative_boundary_requests",
+        "offload_speculative_accepted_tokens",
+        "offload_speculative_dirty_tail_tokens",
+        "offload_load_enqueue_wait_ns",
+        "offload_store_enqueue_wait_ns",
+        "offload_load_enqueue_full",
+        "offload_store_enqueue_full",
+        "offload_load_blocks_submitted",
+        "offload_store_blocks_submitted",
+        "offload_load_descriptors_submitted",
+        "offload_store_descriptors_submitted",
+        "offload_load_bytes_submitted",
+        "offload_store_bytes_submitted",
+        "offload_load_coalesced_spans",
+        "offload_store_coalesced_spans",
+        "offload_load_workspace_reallocations",
+        "offload_store_workspace_reallocations",
+        "offload_native_load_submissions",
+        "offload_native_store_submissions",
+        "offload_native_load_descriptors",
+        "offload_native_store_descriptors",
+        "offload_native_load_bytes",
+        "offload_native_store_bytes",
+        "offload_native_load_submit_ns",
+        "offload_native_store_submit_ns",
+        "offload_native_load_errors",
+        "offload_native_store_errors",
+        "offload_native_load_workspace_reallocations",
+        "offload_native_store_workspace_reallocations",
+        "offload_cpu_kv_capacity_bytes",
+        "offload_cpu_kv_allocated_bytes",
+        "offload_cpu_kv_pinned_bytes",
+        "offload_cpu_kv_allocation_time_ms",
+        "offload_cpu_kv_allocation_mode_empty",
+        "offload_load_coalesced_spans",
+        "offload_store_coalesced_spans",
+    }
+)
+
+
+class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
+    """Prometheus adapter for SimpleCPUOffloadScheduler snapshots."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._metrics: dict[tuple[int, str], PromMetricT] = {}
+        self._counter_keys = _COUNTER_TELEMETRY_KEYS
+
+        for key in SimpleCPUOffloadScheduler.telemetry_keys():
+            metric_cls = (
+                self._counter_cls if key in self._counter_keys else self._gauge_cls
+            )
+            metric = metric_cls(
+                name=f"vllm:simple_cpu_offload_{key}",
+                documentation=f"Simple CPU KV offload {key.replace('_', ' ')}.",
+                labelnames=labelnames,
+            )
+            for engine_idx, labelvalues in per_engine_labelvalues.items():
+                self._metrics[(engine_idx, key)] = metric.labels(*labelvalues)
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        for key, value in transfer_stats_data.items():
+            if key not in SimpleCPUOffloadScheduler.telemetry_keys():
+                continue
+            if not isinstance(value, (int, float)):
+                continue
+            metric = self._metrics.get((engine_idx, key))
+            if metric is None:
+                continue
+            if key in self._counter_keys:
+                metric.inc(value)
+            else:
+                metric.set(value)
+
+
+@dataclass
+class SimpleCPUOffloadConnectorStats(KVConnectorStats):
+    """Serializable scheduler-side transfer telemetry."""
+
+    _activity_keys = (
+        "offload_pending_store_events",
+        "offload_pending_load_reqs",
+        "offload_pending_store_reqs",
+        "offload_store_events",
+        "offload_load_events",
+        "offload_store_blocks",
+        "offload_load_blocks",
+        "offload_store_bytes",
+        "offload_load_bytes",
+        "local_swap_out_bytes",
+        "local_swap_in_bytes",
+        "remote_swap_out_bytes",
+        "remote_swap_in_bytes",
+        "num_remote_fallbacks",
+        "swap_out_time_ms",
+        "swap_in_time_ms",
+        "local_swap_out_time_ms",
+        "local_swap_in_time_ms",
+        "remote_swap_out_time_ms",
+        "remote_swap_in_time_ms",
+    ) + tuple(_COUNTER_TELEMETRY_KEYS)
+    _sum_keys = _COUNTER_TELEMETRY_KEYS
+
+    def reset(self) -> None:
+        self.data = {}
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        assert isinstance(other, SimpleCPUOffloadConnectorStats)
+        merged = dict(self.data)
+        for key, value in other.data.items():
+            if isinstance(value, (int, float)) and key in self._sum_keys:
+                merged[key] = merged.get(key, 0) + value
+            else:
+                merged[key] = value
+        self.data = merged
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        return {
+            key: value
+            for key, value in self.data.items()
+            if isinstance(value, (int, float))
+        }
+
+    def is_empty(self) -> bool:
+        return not self.data
 
 
 class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -75,6 +243,18 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             cpu_capacity_per_rank = explicit
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
+        debug_single_request_swap = bool(
+            extra_config.get("debug_single_request_swap", False)
+        )
+        pin_memory_fix = bool(extra_config.get("pin_memory_fix", False))
+        swapper_block_first = bool(extra_config.get("swapper_block_first", False))
+        min_lazy_store_batch_blocks = int(
+            extra_config.get("min_lazy_store_batch_blocks", 1)
+        )
+        transfer_queue_depth = int(extra_config.get("transfer_queue_depth", 8))
+        cpu_kv_allocation_mode = str(
+            extra_config.get("cpu_kv_allocation_mode", "zero")
+        )
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
@@ -109,10 +289,21 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 lazy_offload=lazy_offload,
+                debug_single_request_swap=debug_single_request_swap,
+                pin_memory_fix=pin_memory_fix,
+                swapper_block_first=swapper_block_first,
+                min_lazy_store_batch_blocks=min_lazy_store_batch_blocks,
+                transfer_queue_depth=transfer_queue_depth,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
-                vllm_config, kv_cache_config, cpu_capacity_per_rank
+                vllm_config,
+                kv_cache_config,
+                cpu_capacity_per_rank,
+                pin_memory_fix=pin_memory_fix,
+                swapper_block_first=swapper_block_first,
+                transfer_queue_depth=transfer_queue_depth,
+                cpu_kv_allocation_mode=cpu_kv_allocation_mode,
             )
 
     # --- Worker-side methods ---
@@ -141,10 +332,15 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self.worker_handler.handle_preemptions(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        pass  # Launch loads ops in get_finished() after launching model execution
+        del forward_context, kwargs
+        if self.worker_handler is not None:
+            self.worker_handler.start_load_kv()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass  # Always load asynchronously and deferred to get_finished()
+        del layer_name
+        # The connector's load event is polled after forward. Attention-layer
+        # waits are not needed because this connector restores complete blocks
+        # before the request is admitted to execution.
 
     def save_kv_layer(
         self,
@@ -237,8 +433,72 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # NOTE: New API only for SimpleCPUOffloadConnector.
     def has_pending_transfers(self) -> bool:
         if self.scheduler_manager is not None:
-            return self.scheduler_manager.has_pending_stores()
+            return self.scheduler_manager.has_pending_transfers()
         return False
+
+    def has_pending_store_transfers(self) -> bool:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.has_pending_store_transfers()
+        return False
+
+    def get_estimated_swap_bandwidth_bytes_per_s(self) -> float | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_estimated_swap_bandwidth_bytes_per_s()
+        return None
+
+    def get_num_free_cpu_blocks(self) -> int | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_free_cpu_blocks()
+        return None
+
+    def get_num_total_cpu_blocks(self) -> int | None:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_total_cpu_blocks()
+        return None
+
+    def get_num_cpu_resident_blocks(self, request: "Request") -> int:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_cpu_resident_blocks(request)
+        return 0
+
+    def get_num_cpu_resident_owned_blocks(self, request: "Request") -> int:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.get_num_cpu_resident_owned_blocks(request)
+        return 0
+
+    def estimate_request_remote_penalty_seconds(self, request: "Request") -> float:
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.estimate_request_remote_penalty_seconds(request)
+        return 0.0
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if self.scheduler_manager is None:
+            return None
+        stats = SimpleCPUOffloadConnectorStats(
+            data=self.scheduler_manager.take_telemetry_stats()
+        )
+        return None if stats.is_empty() else stats
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        return SimpleCPUOffloadConnectorStats(data=data or {})
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return SimpleCPUOffloadPromMetrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         if self.scheduler_manager is not None:
