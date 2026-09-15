@@ -1060,6 +1060,62 @@ def test_proactive_swap_uses_waiting_block_pressure_above_static_budget():
     assert any(req.req_id == waiting_req.request_id for req in out.scheduled_new_reqs)
 
 
+def test_proactive_swap_uses_full_sequence_deficit_not_chunk_pressure():
+    """Swap when full admission fails even if the next chunk fits."""
+    scheduler = _create_simple_offload_scheduler_for_proactive_tests(
+        proactive_swap_budget=1,
+        block_size=4,
+        num_blocks=20,
+        max_num_seqs=2,
+    )
+
+    running_req = create_requests(
+        num_requests=1,
+        num_tokens=8,
+        max_tokens=8,
+        block_size=4,
+        req_ids=["running-full-deficit"],
+    )[0]
+    waiting_req = create_requests(
+        num_requests=1,
+        num_tokens=72,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["waiting-full-deficit"],
+    )[0]
+
+    scheduler.add_request(running_req)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[running_req.request_id],
+            req_id_to_index={running_req.request_id: 0},
+            sampled_token_ids=[[9090]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 17
+
+    scheduler.add_request(waiting_req)
+    immediate_pressure = scheduler._estimate_waiting_block_pressure()
+    required_blocks = scheduler._estimate_waiting_full_sequence_blocks()
+    assert immediate_pressure == 16
+    assert required_blocks == 18
+    out = scheduler.schedule()
+
+    assert scheduler._proactive_waiting_required_blocks == required_blocks
+    assert scheduler._proactive_waiting_block_deficit == 1
+    assert running_req.status == RequestStatus.PREEMPTED
+    assert running_req.request_id in out.preempted_req_ids
+    assert waiting_req.status == RequestStatus.RUNNING
+    assert waiting_req.request_id in {
+        req.req_id for req in out.scheduled_new_reqs
+    }
+
+
 def test_proactive_swap_multi_vlt_keeps_slo_violating_request_running():
     scheduler = _create_simple_offload_scheduler_for_proactive_tests(
         proactive_swap_budget=5,
@@ -1909,6 +1965,7 @@ def test_proactive_swap_skips_when_cpu_swap_pool_is_full():
     assert scheduler.connector is not None
     orig = scheduler.connector.get_num_free_cpu_blocks
     scheduler.connector.get_num_free_cpu_blocks = Mock(return_value=0)  # type: ignore[method-assign]
+    scheduler._superinfer_high_risk_mode = True
 
     scheduler.add_request(waiting_req)
     out = scheduler.schedule()
@@ -1917,6 +1974,13 @@ def test_proactive_swap_skips_when_cpu_swap_pool_is_full():
     assert running_req in scheduler.running
     assert waiting_req in scheduler.waiting
     assert running_req.request_id not in out.preempted_req_ids
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_proactive_no_candidate_cpu_capacity_rounds >= 1
+    assert stats.proactive_waiting_required_blocks > 0
+    assert stats.proactive_waiting_free_blocks >= 0
+    assert stats.proactive_waiting_block_deficit >= 0
 
     scheduler.connector.get_num_free_cpu_blocks = orig  # type: ignore[method-assign]
 
@@ -2824,7 +2888,8 @@ def test_scheduler_stats_waiting_queues(monkeypatch: pytest.MonkeyPatch):
 
     # Verify stats match queue lengths after scheduling
     assert stats.num_running_reqs == 2  # 2 were scheduled
-    assert stats.num_waiting_reqs == 1  # 1 waiting on capacity
+    assert stats.num_waiting_reqs == 1  # 1 waiting in the ordinary queue
+    assert stats.num_capacity_waiting_reqs == 0
     assert stats.num_skipped_waiting_reqs == 2  # 2 blocked by constraints
     assert stats.num_active_reqs == 3
     assert stats.num_waiting_for_remote_kv_reqs == 2
@@ -3267,6 +3332,14 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 1
 
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.capacity_wait_max_prompt_tokens == NUM_TOKENS
+    assert stats.capacity_wait_max_current_tokens == NUM_TOKENS
+    assert stats.capacity_wait_max_output_tokens == MAX_TOKENS
+    assert stats.capacity_wait_max_required_blocks > stats.capacity_wait_free_blocks
+    assert stats.capacity_wait_max_block_deficit > 0
+
     # All memory should be freed, with one request waiting.
     _step_until_done(scheduler, output, MODEL_RUNNER_OUTPUT)
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
@@ -3283,11 +3356,201 @@ def test_kv_connector_unable_to_allocate(use_ec_connector, ec_role):
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 0
 
-    # All memory should be freed, with no requests waiting / running.
-    _step_until_done(scheduler, output, MODEL_RUNNER_OUTPUT)
-    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == NUM_BLOCKS - 1
+
+def test_capacity_wait_reproduction_is_bounded_and_diagnostic() -> None:
+    """Reproduce the production stale state without allowing the test to hang.
+
+    A full-attention request occupies nearly the whole pool. A second request
+    cannot pass full-sequence admission immediately, but it fits once the
+    running request releases its blocks.
+
+    The scheduling attempt verifies that a temporary capacity wait remains
+    recoverable and emits numeric diagnostics.
+    """
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        num_blocks=10,
+        max_num_seqs=2,
+    )
+    running, waiting = create_requests(
+        num_requests=2,
+        num_tokens=16,
+        max_tokens=2,
+        block_size=4,
+        req_ids=["capacity-running", "capacity-waiting"],
+    )
+    waiting.prompt_token_ids = [0] * 28
+    waiting._all_token_ids = waiting.prompt_token_ids.copy()
+    waiting.num_prompt_tokens = 28
+    waiting.update_block_hashes()
+    scheduler.add_request(running)
+    scheduler.add_request(waiting)
+
+    first = scheduler.schedule()
+    assert len(scheduler.running) == 1
+    assert len(scheduler.waiting) == 1
+
+    stats = scheduler.make_stats()
+    assert stats is not None
+    assert stats.num_running_reqs == 1
+    assert stats.num_waiting_reqs == 1
+    assert stats.num_capacity_waiting_reqs == 1
+    assert stats.capacity_wait_max_prompt_tokens == waiting.num_prompt_tokens
+    assert stats.capacity_wait_max_current_tokens == waiting.num_tokens
+    assert stats.capacity_wait_max_output_tokens == waiting.max_tokens
+    assert stats.capacity_wait_max_required_blocks > stats.capacity_wait_free_blocks
+    assert stats.capacity_wait_max_block_deficit > 0
+
+    model_output = ModelRunnerOutput(
+        req_ids=[running.request_id],
+        req_id_to_index={running.request_id: 0},
+        sampled_token_ids=[[EOS_TOKEN_ID]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(first, model_output)
+
+    assert len(scheduler.running) == 0
+    assert len(scheduler.waiting) == 1
+
+    # Once the running request completes, the waiting request can be admitted.
+    second = scheduler.schedule()
+    assert len(scheduler.running) == 1
+    assert len(scheduler.waiting) == 0
+    scheduler.update_from_output(
+        second,
+        ModelRunnerOutput(
+            req_ids=[waiting.request_id],
+            req_id_to_index={waiting.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
     assert len(scheduler.running) == 0
     assert len(scheduler.waiting) == 0
+
+
+def test_oversized_capacity_wait_is_rejected_instead_of_stalling() -> None:
+    """An impossible request must not remain queued forever."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=4,
+        num_blocks=10,
+        max_num_seqs=1,
+    )
+    request = create_requests(
+        num_requests=1,
+        num_tokens=40,
+        max_tokens=2,
+        block_size=4,
+        req_ids=["oversized-capacity-request"],
+    )[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert request.status == RequestStatus.FINISHED_ERROR
+    assert request.request_id not in scheduler.requests
+    assert request.request_id in output.finished_req_ids
+
+    outputs = scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    error_outputs = outputs[request.client_index].outputs
+    assert len(error_outputs) == 1
+    assert error_outputs[0].request_id == request.request_id
+    assert error_outputs[0].finish_reason == FinishReason.ERROR
+
+    # All memory should be freed, with no requests waiting / running.
+    assert (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+        == scheduler.kv_cache_manager.block_pool.num_gpu_blocks - 1
+    )
+    assert len(scheduler.running) == 0
+    assert len(scheduler.waiting) == 0
+
+
+def test_stale_capacity_wait_times_out_when_no_request_is_running() -> None:
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        num_blocks=10,
+        block_size=4,
+        max_num_seqs=2,
+        capacity_wait_timeout=1.0,
+    )
+    running, waiting = create_requests(
+        num_requests=2,
+        num_tokens=16,
+        max_tokens=2,
+        block_size=4,
+        req_ids=["stale-capacity-running", "stale-capacity-waiting"],
+    )
+    waiting.prompt_token_ids = [0] * 28
+    waiting._all_token_ids = waiting.prompt_token_ids.copy()
+    waiting.num_prompt_tokens = 28
+    waiting.update_block_hashes()
+    scheduler.add_request(running)
+    scheduler.add_request(waiting)
+
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[running.request_id],
+            req_id_to_index={running.request_id: 0},
+            sampled_token_ids=[[EOS_TOKEN_ID]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert not scheduler.running
+    assert waiting.request_id in scheduler._capacity_wait_started_at
+
+    # Keep the allocator in the production-shaped stale state: cached blocks
+    # or another allocator owner can leave no immediately free blocks even
+    # after the last running request has drained.
+    original_get_num_free_blocks = (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks
+    )
+    scheduler.kv_cache_manager.block_pool.get_num_free_blocks = Mock(return_value=0)  # type: ignore[method-assign]
+    scheduler._capacity_wait_started_at[waiting.request_id] -= 2.0
+    timed_out = scheduler.schedule()
+    scheduler.kv_cache_manager.block_pool.get_num_free_blocks = (  # type: ignore[method-assign]
+        original_get_num_free_blocks
+    )
+
+    assert waiting.status == RequestStatus.FINISHED_ERROR
+    assert waiting.request_id not in scheduler.requests
+    assert waiting.request_id not in scheduler._capacity_wait_started_at
+    assert waiting.request_id not in scheduler._capacity_waiting_req_ids
+    assert waiting.request_id in timed_out.finished_req_ids
+    assert not scheduler.waiting
+
+    outputs = scheduler.update_from_output(
+        timed_out,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert outputs[waiting.client_index].outputs[0].finish_reason == FinishReason.ERROR
 
 
 @pytest.mark.parametrize("is_async", [False, True])

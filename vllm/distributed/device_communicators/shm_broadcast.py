@@ -5,7 +5,7 @@ import pickle
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pickle import PickleBuffer
@@ -200,6 +200,19 @@ class SpinCondition:
         assert not self.is_reader, "Only writers can notify"
         self.local_notify_socket.send(b"\x00")
 
+    def close(self) -> None:
+        """Close notification sockets owned by this condition."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        for socket in (
+            self.local_notify_socket,
+            self.read_cancel_socket,
+            self.write_cancel_socket,
+        ):
+            if socket is not None:
+                socket.close(linger=0)
+
 
 class ShmRingBuffer:
     def __init__(
@@ -262,6 +275,7 @@ class ShmRingBuffer:
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
         self.max_chunks = max_chunks
+        self._closed = False
         self.total_bytes_of_buffer = (
             self.max_chunk_bytes + self.metadata_size
         ) * self.max_chunks
@@ -317,10 +331,19 @@ class ShmRingBuffer:
         )
 
     def __del__(self):
+        with suppress(Exception):
+            self.close()
+
+    def close(self) -> None:
+        """Close and unlink the ring buffer when this side created it."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if hasattr(self, "shared_memory"):
             self.shared_memory.close()
             if self.is_creator:
-                self.shared_memory.unlink()
+                with suppress(FileNotFoundError):
+                    self.shared_memory.unlink()
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -370,7 +393,9 @@ class MessageQueue:
         n_remote_reader = n_reader - n_local_reader
         self.n_remote_reader = n_remote_reader
         self.shutting_down = False
+        self._closed = False
         context = Context()
+        self._context = context
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -452,6 +477,7 @@ class MessageQueue:
         self._is_writer = False
 
         context = Context()
+        self._context = context
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer_handle is not None
@@ -491,6 +517,7 @@ class MessageQueue:
             self._spin_condition = None  # type: ignore
 
         self.shutting_down = False
+        self._closed = False
         return self
 
     def wait_until_ready(self):
@@ -529,9 +556,30 @@ class MessageQueue:
     def shutdown(self):
         """If this is an idle reader, wakes it up so it can clean up and shut
         down"""
+        if self._closed or self.shutting_down:
+            return
         self.shutting_down = True
         if self._spin_condition is not None:
             self._spin_condition.cancel()
+
+    def close(self) -> None:
+        """Close sockets and release this queue's shared-memory resources."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if self._spin_condition is not None:
+            self._spin_condition.close()
+        for socket in (
+            getattr(self, "local_socket", None),
+            getattr(self, "remote_socket", None),
+        ):
+            if socket is not None:
+                socket.close(linger=0)
+        if self.buffer is not None:
+            self.buffer.close()
+        context = getattr(self, "_context", None)
+        if context is not None:
+            context.term()
 
     @contextmanager
     def acquire_write(self, timeout: float | None = None):

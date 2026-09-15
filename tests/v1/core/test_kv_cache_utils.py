@@ -21,6 +21,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
@@ -388,6 +389,7 @@ def test_free_kv_cache_block_queue_popleft_n():
     for block in result_blocks:
         assert block.prev_free_block is None
         assert block.next_free_block is None
+
     # Pop 2 blocks
     # fake_head->b4->b0->b2->fake_tail
     result_blocks = queue.popleft_n(2)
@@ -398,6 +400,7 @@ def test_free_kv_cache_block_queue_popleft_n():
     for block in result_blocks:
         assert block.prev_free_block is None
         assert block.next_free_block is None
+
     # Pop 3 blocks
     # fake_head->fake_tail
     result_blocks = queue.popleft_n(3)
@@ -409,6 +412,30 @@ def test_free_kv_cache_block_queue_popleft_n():
     for block in result_blocks:
         assert block.prev_free_block is None
         assert block.next_free_block is None
+
+
+def test_free_kv_cache_block_queue_popleft_n_rejects_stale_counter_atomically():
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    queue.num_free_blocks += 1
+
+    with pytest.raises(ValueError, match="Cannot get 4 free blocks"):
+        queue.popleft_n(4)
+
+    assert queue.num_free_blocks == 4
+    assert queue.fake_free_list_head.next_free_block is blocks[0]
+    assert queue.fake_free_list_tail.prev_free_block is blocks[2]
+
+
+def test_block_pool_free_deduplicates_queue_insertion():
+    pool = BlockPool(num_gpu_blocks=4, enable_caching=False, hash_block_size=2)
+    block = pool.get_new_blocks(1)[0]
+    block.ref_cnt += 1
+
+    pool.free_blocks([block, block])
+
+    assert pool.get_num_free_blocks() == 3
+    assert pool.free_block_queue.get_all_free_blocks().count(block) == 1
 
 
 def test_free_kv_cache_block_queue_get_all_free_blocks():

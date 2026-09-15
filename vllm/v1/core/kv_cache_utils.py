@@ -259,26 +259,28 @@ class FreeKVCacheBlockQueue:
         """
         if n == 0:
             return []
-        assert self.num_free_blocks >= n
-        self.num_free_blocks -= n
+        if n < 0 or self.num_free_blocks < n:
+            raise ValueError(f"Cannot get {n} free blocks from the pool")
 
         curr_block = self.fake_free_list_head.next_free_block
-        # Pop n blocks from the head of the list
-        ret = []
+        # Validate the linked list before mutating it. The counter can be stale
+        # after a duplicate free; turn that condition into a recoverable cache
+        # miss instead of partially unlinking blocks and asserting mid-loop.
+        ret: list[KVCacheBlock] = []
         for _ in range(n):
-            assert curr_block is not None
+            if curr_block is None or curr_block is self.fake_free_list_tail:
+                raise ValueError(f"Cannot get {n} free blocks from the pool")
             ret.append(curr_block)
-            last_block = curr_block
             curr_block = curr_block.next_free_block
-            # Reset prev_free_block and next_free_block of all popped blocks
-            last_block.prev_free_block = None
-            last_block.next_free_block = None
 
-        if curr_block is not None:
-            # The queue is not empty, connect the fake head to
-            # the new first block.
-            self.fake_free_list_head.next_free_block = curr_block
-            curr_block.prev_free_block = self.fake_free_list_head
+        self.num_free_blocks -= n
+        for block in ret:
+            block.prev_free_block = None
+            block.next_free_block = None
+
+        # The queue may now be empty, in which case curr_block is the fake tail.
+        self.fake_free_list_head.next_free_block = curr_block
+        curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:

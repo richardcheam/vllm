@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -399,6 +402,51 @@ def test_evictable_cached_blocks_not_double_allocated():
     )
     assert len(new_blocks) == 1
     assert len(manager.req_to_blocks[request_id]) == 2
+
+
+def test_grouped_allocation_rolls_back_late_pool_exhaustion():
+    """A late group shortage must not leave earlier groups allocated."""
+    block_pool = BlockPool(
+        num_gpu_blocks=3, enable_caching=False, hash_block_size=2
+    )
+
+    class FakeManager:
+        def __init__(self, fail: bool):
+            self.fail = fail
+            self.block_pool = block_pool
+            self.req_to_blocks = defaultdict(list)
+            self.new_block_ids: list[int] = []
+
+        def get_num_blocks_to_allocate(self, *args):
+            # Deliberately model a stale preflight estimate. The transactional
+            # path must still restore state when allocation discovers the miss.
+            return 0
+
+        def allocate_new_blocks(self, request_id, num_tokens, num_tokens_main_model):
+            if self.fail:
+                self.block_pool.get_new_blocks(2)
+            block = self.block_pool.get_new_blocks(1)[0]
+            self.req_to_blocks[request_id].append(block)
+            self.new_block_ids.append(block.block_id)
+            return [block]
+
+    first = FakeManager(fail=False)
+    second = FakeManager(fail=True)
+    coordinator = SimpleNamespace(
+        single_type_managers=(first, second),
+        block_pool=block_pool,
+    )
+
+    allocated = KVCacheCoordinator.allocate_new_blocks(
+        coordinator, "request", num_tokens=2, num_tokens_main_model=2
+    )
+
+    assert allocated is None
+    assert block_pool.get_num_free_blocks() == 2
+    assert first.req_to_blocks["request"] == []
+    assert second.req_to_blocks["request"] == []
+    assert first.new_block_ids == []
+    assert second.new_block_ids == []
 
 
 def test_chunked_local_attention_get_num_blocks_to_allocate():

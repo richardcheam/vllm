@@ -204,8 +204,23 @@ class Scheduler(SchedulerInterface):
         self._proactive_already_free_skips = 0
         self._proactive_cpu_capacity_skips = 0
         self._proactive_no_candidate_rounds = 0
+        self._proactive_no_candidate_cpu_capacity_rounds = 0
         self._proactive_cpu_pressure_skips = 0
         self._proactive_locality_penalty_s = 0.0
+        self._proactive_waiting_required_blocks = 0
+        self._proactive_waiting_free_blocks = 0
+        self._proactive_waiting_block_deficit = 0
+
+        # Last full-sequence admission failure, kept numeric-only for diagnosis.
+        self._capacity_wait_max_prompt_tokens = 0
+        self._capacity_wait_max_current_tokens = 0
+        self._capacity_wait_max_output_tokens = 0
+        self._capacity_wait_max_required_blocks = 0
+        self._capacity_wait_free_blocks = 0
+        self._capacity_wait_max_block_deficit = 0
+        self._capacity_failed_requests: list[Request] = []
+        self._capacity_wait_started_at: dict[str, float] = {}
+        self._capacity_waiting_req_ids: set[str] = set()
 
         # Guard against preempting the same request too frequently.
         self._proactive_preempt_cooldown_s = 0.05
@@ -395,6 +410,7 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        self._capacity_waiting_req_ids.clear()
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -799,14 +815,93 @@ class Scheduler(SchedulerInterface):
 
                 if (
                     self.scheduler_reserve_full_isl
-                    and not self.kv_cache_manager.can_fit_full_sequence(
-                        request,
-                        num_new_computed_tokens=num_new_local_computed_tokens,
-                        new_computed_blocks=new_computed_blocks,
-                        num_external_computed_tokens=num_external_computed_tokens,
-                        num_encoder_tokens=num_encoder_tokens,
+                    and (
+                        required_blocks := self.kv_cache_manager.get_num_blocks_to_allocate(
+                            request_id=request.request_id,
+                            num_tokens=min(request.num_tokens, self.max_model_len),
+                            new_computed_blocks=new_computed_blocks,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            num_encoder_tokens=num_encoder_tokens,
+                            total_computed_tokens=(
+                                request.num_computed_tokens
+                                + num_new_local_computed_tokens
+                                + num_external_computed_tokens
+                            ),
+                            num_tokens_main_model=min(
+                                request.num_tokens, self.max_model_len
+                            ),
+                        )
                     )
+                    > self.kv_cache_manager.block_pool.get_num_free_blocks()
                 ):
+                    total_blocks = max(
+                        self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0
+                    )
+                    if required_blocks > total_blocks:
+                        # This request can never fit, even after every other
+                        # request releases its KV blocks. Do not leave it in
+                        # WAITING forever while the engine has no work to run.
+                        request_queue.pop_request()
+                        logger.warning(
+                            "Rejecting request that needs %d KV blocks, "
+                            "but the KV cache has only %d usable blocks",
+                            required_blocks,
+                            total_blocks,
+                        )
+                        self.finish_requests(
+                            request.request_id, RequestStatus.FINISHED_ERROR
+                        )
+                        self._capacity_failed_requests.append(request)
+                        self._capacity_wait_started_at.pop(request.request_id, None)
+                        continue
+
+                    free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                    now = time.monotonic()
+                    wait_started_at = self._capacity_wait_started_at.setdefault(
+                        request.request_id, now
+                    )
+                    capacity_wait_timeout = self.scheduler_config.capacity_wait_timeout
+                    if (
+                        not self.running
+                        and capacity_wait_timeout > 0
+                        and now - wait_started_at >= capacity_wait_timeout
+                    ):
+                        request_queue.pop_request()
+                        logger.warning(
+                            "Failing capacity-stalled request after %.1f seconds "
+                            "without runnable GPU capacity",
+                            now - wait_started_at,
+                        )
+                        self.finish_requests(
+                            request.request_id, RequestStatus.FINISHED_ERROR
+                        )
+                        self._capacity_failed_requests.append(request)
+                        self._capacity_wait_started_at.pop(request.request_id, None)
+                        continue
+
+                    self._capacity_wait_max_prompt_tokens = max(
+                        self._capacity_wait_max_prompt_tokens,
+                        request.num_prompt_tokens,
+                    )
+                    self._capacity_wait_max_current_tokens = max(
+                        self._capacity_wait_max_current_tokens,
+                        request.num_tokens,
+                    )
+                    self._capacity_wait_max_output_tokens = max(
+                        self._capacity_wait_max_output_tokens,
+                        request.max_tokens,
+                    )
+                    self._capacity_wait_max_required_blocks = max(
+                        self._capacity_wait_max_required_blocks,
+                        required_blocks,
+                    )
+                    self._capacity_wait_free_blocks = free_blocks
+                    self._capacity_wait_max_block_deficit = max(
+                        self._capacity_wait_max_block_deficit,
+                        required_blocks - free_blocks,
+                    )
+                    self._capacity_waiting_req_ids.add(request.request_id)
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
@@ -852,6 +947,8 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                self._capacity_wait_started_at.pop(request.request_id, None)
+                self._capacity_waiting_req_ids.discard(request.request_id)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1221,6 +1318,26 @@ class Scheduler(SchedulerInterface):
             self._estimate_request_immediate_block_pressure(req) for req in requests
         )
 
+    def _estimate_waiting_full_sequence_blocks(self) -> int:
+        """Estimate the full KV reservation for schedulable waiting work."""
+        required_blocks = 0
+        for request_queue in (self.waiting, self.skipped_waiting):
+            if not request_queue:
+                continue
+            request = request_queue.peek_request()
+            if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                continue
+            required_blocks = max(
+                required_blocks,
+                self.kv_cache_manager.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=min(request.num_tokens, self.max_model_len),
+                    total_computed_tokens=request.num_computed_tokens,
+                    num_tokens_main_model=min(request.num_tokens, self.max_model_len),
+                ),
+            )
+        return required_blocks
+
     def _estimate_request_immediate_block_pressure(self, request: Request) -> int:
         remaining_tokens = request.num_tokens - request.num_computed_tokens
         if remaining_tokens <= 0:
@@ -1377,14 +1494,26 @@ class Scheduler(SchedulerInterface):
                 self._proactive_cpu_pressure_skips += 1
                 return []
 
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         waiting_block_pressure = self._estimate_waiting_block_pressure()
+        waiting_required_blocks = self._estimate_waiting_full_sequence_blocks()
+        waiting_deficit = max(waiting_required_blocks - free_blocks, 0)
+        self._proactive_waiting_required_blocks = max(
+            self._proactive_waiting_required_blocks,
+            waiting_required_blocks,
+        )
+        self._proactive_waiting_free_blocks = free_blocks
+        self._proactive_waiting_block_deficit = max(
+            self._proactive_waiting_block_deficit,
+            waiting_deficit,
+        )
         target_free = min(
-            max(budget, waiting_block_pressure),
+            max(budget, waiting_block_pressure, waiting_required_blocks),
             max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0),
         )
         if target_free <= 0:
             return []
-        if self.kv_cache_manager.block_pool.get_num_free_blocks() >= target_free:
+        if free_blocks >= target_free:
             self._proactive_already_free_skips += 1
             return []
 
@@ -1392,6 +1521,7 @@ class Scheduler(SchedulerInterface):
         while self.kv_cache_manager.block_pool.get_num_free_blocks() < target_free:
             now = time.monotonic()
             candidates = []
+            cpu_capacity_rejected = False
             for req in self.running:
                 if not self._is_proactive_swap_candidate(req):
                     continue
@@ -1404,10 +1534,13 @@ class Scheduler(SchedulerInterface):
                         req
                     )
                     if total_swap_blocks <= 0 or unsynced_swap_blocks > cpu_free_blocks:
+                        cpu_capacity_rejected = True
                         continue
                 candidates.append(req)
             if not candidates:
                 self._proactive_no_candidate_rounds += 1
+                if cpu_capacity_rejected:
+                    self._proactive_no_candidate_cpu_capacity_rounds += 1
                 break
 
             if not self._superinfer_high_risk_mode:
@@ -2026,6 +2159,19 @@ class Scheduler(SchedulerInterface):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
+        capacity_failed_requests = getattr(self, "_capacity_failed_requests", [])
+        for request in capacity_failed_requests:
+            outputs[request.client_index].append(
+                EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
+        capacity_failed_requests.clear()
+
         engine_core_outputs = {
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
@@ -2284,6 +2430,8 @@ class Scheduler(SchedulerInterface):
 
         # First pass: collect requests to remove from queues
         for req_id in request_ids:
+            self._capacity_wait_started_at.pop(req_id, None)
+            self._capacity_waiting_req_ids.discard(req_id)
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # Invalid request ID.
@@ -2323,6 +2471,8 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+        self._capacity_wait_started_at.pop(request.request_id, None)
+        self._capacity_waiting_req_ids.discard(request.request_id)
 
         self._clear_rotary_swap_accounting(request)
 
@@ -2480,6 +2630,7 @@ class Scheduler(SchedulerInterface):
             num_active_reqs=len(self.requests),
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
+            num_capacity_waiting_reqs=len(self._capacity_waiting_req_ids),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             num_preempted_reqs=num_preempted_reqs,
             num_rotary_preempted_reqs=self._rotary_preemptions,
@@ -2493,8 +2644,14 @@ class Scheduler(SchedulerInterface):
             num_proactive_already_free_skips=self._proactive_already_free_skips,
             num_proactive_cpu_capacity_skips=self._proactive_cpu_capacity_skips,
             num_proactive_no_candidate_rounds=self._proactive_no_candidate_rounds,
+            num_proactive_no_candidate_cpu_capacity_rounds=(
+                self._proactive_no_candidate_cpu_capacity_rounds
+            ),
             num_proactive_cpu_pressure_skips=self._proactive_cpu_pressure_skips,
             proactive_locality_penalty_ms=int(self._proactive_locality_penalty_s * 1000.0),
+            proactive_waiting_required_blocks=self._proactive_waiting_required_blocks,
+            proactive_waiting_free_blocks=self._proactive_waiting_free_blocks,
+            proactive_waiting_block_deficit=self._proactive_waiting_block_deficit,
             num_waiting_for_remote_kv_reqs=num_waiting_for_remote_kv_reqs,
             num_remote_wait_entries=self._remote_wait_entries,
             num_remote_wait_promotions=self._remote_wait_promotions,
@@ -2510,6 +2667,16 @@ class Scheduler(SchedulerInterface):
             kv_cache_total_blocks=kv_total_blocks,
             kv_cache_used_blocks=kv_used_blocks,
             kv_cache_free_blocks=kv_free_blocks,
+            capacity_wait_max_prompt_tokens=self._capacity_wait_max_prompt_tokens,
+            capacity_wait_max_current_tokens=self._capacity_wait_max_current_tokens,
+            capacity_wait_max_output_tokens=self._capacity_wait_max_output_tokens,
+            capacity_wait_max_required_blocks=self._capacity_wait_max_required_blocks,
+            capacity_wait_free_blocks=(
+                self._capacity_wait_free_blocks
+                if self._capacity_wait_free_blocks > 0
+                else kv_free_blocks
+            ),
+            capacity_wait_max_block_deficit=self._capacity_wait_max_block_deficit,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
@@ -2529,8 +2696,19 @@ class Scheduler(SchedulerInterface):
         self._proactive_already_free_skips = 0
         self._proactive_cpu_capacity_skips = 0
         self._proactive_no_candidate_rounds = 0
+        self._proactive_no_candidate_cpu_capacity_rounds = 0
         self._proactive_cpu_pressure_skips = 0
         self._proactive_locality_penalty_s = 0.0
+        self._proactive_waiting_required_blocks = 0
+        self._proactive_waiting_free_blocks = 0
+        self._proactive_waiting_block_deficit = 0
+        self._capacity_wait_max_prompt_tokens = 0
+        self._capacity_wait_max_current_tokens = 0
+        self._capacity_wait_max_output_tokens = 0
+        self._capacity_wait_max_required_blocks = 0
+        self._capacity_wait_free_blocks = 0
+        self._capacity_wait_max_block_deficit = 0
+        self._capacity_waiting_req_ids.clear()
         self._remote_wait_entries = 0
         self._remote_wait_promotions = 0
         return stats

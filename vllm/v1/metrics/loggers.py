@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 
 # User-facing reason labels for waiting request breakdown
 WAITING_REASON_CAPACITY = "capacity"
+WAITING_REASON_QUEUE = "queue"
 WAITING_REASON_DEFERRED = "deferred"
 
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
@@ -241,6 +242,10 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("Deferred: %d reqs")
             log_args.append(self.last_scheduler_stats.num_skipped_waiting_reqs)
 
+        if self.last_scheduler_stats.num_capacity_waiting_reqs > 0:
+            log_parts.append("Capacity waiting: %d reqs")
+            log_args.append(self.last_scheduler_stats.num_capacity_waiting_reqs)
+
         if self.num_preemptions > 0:
             log_parts.append("Preemptions: %d")
             log_args.append(self.num_preemptions)
@@ -336,6 +341,9 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
         for last_scheduler_stats in self.last_scheduler_stats_dict.values():
             self.last_scheduler_stats.num_waiting_reqs += (
                 last_scheduler_stats.num_waiting_reqs
+            )
+            self.last_scheduler_stats.num_capacity_waiting_reqs += (
+                last_scheduler_stats.num_capacity_waiting_reqs
             )
             self.last_scheduler_stats.num_running_reqs += (
                 last_scheduler_stats.num_running_reqs
@@ -473,6 +481,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             documentation=(
                 "Number of waiting requests by reason. "
                 "Reason labels: 'capacity' = waiting for scheduling capacity; "
+                "'queue' = waiting in the ordinary scheduler queue; "
                 "'deferred' = deferred by transient constraints "
                 "(LoRA budget, KV transfer, blocked status). "
                 "Sum of all reasons equals vllm:num_requests_waiting."
@@ -481,7 +490,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             labelnames=labelnames + ["reason"],
         )
         self.gauge_waiting_by_reason: dict[str, dict[int, Gauge]] = {}
-        for waiting_reason in [WAITING_REASON_CAPACITY, WAITING_REASON_DEFERRED]:
+        for waiting_reason in [
+            WAITING_REASON_CAPACITY,
+            WAITING_REASON_QUEUE,
+            WAITING_REASON_DEFERRED,
+        ]:
             per_engine_labelvalues_with_reason = {
                 idx: labelvalues + [waiting_reason]
                 for idx, labelvalues in per_engine_labelvalues.items()
@@ -525,6 +538,149 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
         )
+
+        kv_cache_capacity_metrics = (
+            (
+                "vllm:kv_cache_total_blocks",
+                "Usable GPU KV-cache blocks, excluding the null block.",
+            ),
+            (
+                "vllm:kv_cache_used_blocks",
+                "GPU KV-cache blocks currently in use.",
+            ),
+            (
+                "vllm:kv_cache_free_blocks",
+                "GPU KV-cache blocks currently free.",
+            ),
+        )
+        self.kv_cache_capacity_metrics = {}
+        for name, documentation in kv_cache_capacity_metrics:
+            gauge = self._gauge_cls(
+                name=name,
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.kv_cache_capacity_metrics[name] = create_metric_per_engine(
+                gauge, per_engine_labelvalues
+            )
+
+        offload_counter_keys = (
+            "offload_store_events",
+            "offload_load_events",
+            "offload_store_blocks",
+            "offload_load_blocks",
+            "offload_store_bytes",
+            "offload_load_bytes",
+            "local_swap_out_bytes",
+            "local_swap_in_bytes",
+            "remote_swap_out_bytes",
+            "remote_swap_in_bytes",
+        )
+        self.offload_counter_metrics = {}
+        for key in offload_counter_keys:
+            counter = self._counter_cls(
+                name=f"vllm:{key}",
+                documentation=f"Simple CPU KV offload {key.replace('_', ' ')}.",
+                labelnames=labelnames,
+            )
+            self.offload_counter_metrics[key] = create_metric_per_engine(
+                counter, per_engine_labelvalues
+            )
+
+        offload_gauge_keys = (
+            "offload_pending_store_events",
+            "offload_pending_load_reqs",
+            "offload_pending_store_reqs",
+            "offload_pending_load_wait_ms",
+            "offload_pending_load_age_ms",
+            "offload_pending_store_age_ms",
+            "offload_pending_transfer_age_ms",
+            "offload_cpu_total_blocks",
+            "offload_cpu_free_blocks",
+            "offload_cpu_used_blocks",
+            "offload_lazy_target_free_blocks",
+            "offload_proactive_swap_budget",
+        )
+        self.offload_gauge_metrics = {}
+        for key in offload_gauge_keys:
+            gauge = self._gauge_cls(
+                name=f"vllm:{key}",
+                documentation=f"Simple CPU KV offload {key.replace('_', ' ')}.",
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.offload_gauge_metrics[key] = create_metric_per_engine(
+                gauge, per_engine_labelvalues
+            )
+
+        capacity_wait_metrics = (
+            (
+                "vllm:capacity_wait_max_prompt_tokens",
+                "Largest prompt token count among full-sequence capacity waits.",
+            ),
+            (
+                "vllm:capacity_wait_max_current_tokens",
+                "Largest current token count among full-sequence capacity waits.",
+            ),
+            (
+                "vllm:capacity_wait_max_output_tokens",
+                "Largest requested output token count among capacity waits.",
+            ),
+            (
+                "vllm:capacity_wait_max_required_blocks",
+                "Largest estimated required KV blocks among capacity waits.",
+            ),
+            (
+                "vllm:capacity_wait_free_blocks",
+                "Free GPU KV blocks observed during a capacity wait.",
+            ),
+            (
+                "vllm:capacity_wait_max_block_deficit",
+                "Largest estimated KV block deficit among capacity waits.",
+            ),
+        )
+        self.capacity_wait_metrics = {}
+        for name, documentation in capacity_wait_metrics:
+            gauge = self._gauge_cls(
+                name=name,
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.capacity_wait_metrics[name] = create_metric_per_engine(
+                gauge, per_engine_labelvalues
+            )
+
+        proactive_pressure_metrics = (
+            (
+                "vllm:proactive_waiting_required_blocks",
+                "Largest full-sequence KV requirement observed by proactive swap.",
+            ),
+            (
+                "vllm:proactive_waiting_free_blocks",
+                "Free GPU KV blocks observed by proactive swap.",
+            ),
+            (
+                "vllm:proactive_waiting_block_deficit",
+                "Largest full-sequence KV block deficit observed by proactive swap.",
+            ),
+            (
+                "vllm:num_proactive_no_candidate_cpu_capacity_rounds",
+                "Proactive swap rounds with no candidate due to CPU KV capacity.",
+            ),
+        )
+        self.proactive_pressure_metrics = {}
+        for name, documentation in proactive_pressure_metrics:
+            gauge = self._gauge_cls(
+                name=name,
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=labelnames,
+            )
+            self.proactive_pressure_metrics[name] = create_metric_per_engine(
+                gauge, per_engine_labelvalues
+            )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
@@ -1073,12 +1229,65 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_scheduler_waiting[engine_idx].set(total_waiting)
             self.gauge_waiting_by_reason[WAITING_REASON_CAPACITY][engine_idx].set(
-                scheduler_stats.num_waiting_reqs
+                scheduler_stats.num_capacity_waiting_reqs
+            )
+            self.gauge_waiting_by_reason[WAITING_REASON_QUEUE][engine_idx].set(
+                max(
+                    scheduler_stats.num_waiting_reqs
+                    - scheduler_stats.num_capacity_waiting_reqs,
+                    0,
+                )
             )
             self.gauge_waiting_by_reason[WAITING_REASON_DEFERRED][engine_idx].set(
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            kv_cache_fields = {
+                "vllm:kv_cache_total_blocks": "kv_cache_total_blocks",
+                "vllm:kv_cache_used_blocks": "kv_cache_used_blocks",
+                "vllm:kv_cache_free_blocks": "kv_cache_free_blocks",
+            }
+            for name, metrics in self.kv_cache_capacity_metrics.items():
+                metrics[engine_idx].set(getattr(scheduler_stats, kv_cache_fields[name]))
+
+            capacity_values = {
+                "vllm:capacity_wait_max_prompt_tokens": scheduler_stats.capacity_wait_max_prompt_tokens,
+                "vllm:capacity_wait_max_current_tokens": scheduler_stats.capacity_wait_max_current_tokens,
+                "vllm:capacity_wait_max_output_tokens": scheduler_stats.capacity_wait_max_output_tokens,
+                "vllm:capacity_wait_max_required_blocks": scheduler_stats.capacity_wait_max_required_blocks,
+                "vllm:capacity_wait_free_blocks": scheduler_stats.capacity_wait_free_blocks,
+                "vllm:capacity_wait_max_block_deficit": scheduler_stats.capacity_wait_max_block_deficit,
+            }
+            for name, value in capacity_values.items():
+                self.capacity_wait_metrics[name][engine_idx].set(value)
+
+            proactive_values = {
+                "vllm:proactive_waiting_required_blocks": (
+                    scheduler_stats.proactive_waiting_required_blocks
+                ),
+                "vllm:proactive_waiting_free_blocks": (
+                    scheduler_stats.proactive_waiting_free_blocks
+                ),
+                "vllm:proactive_waiting_block_deficit": (
+                    scheduler_stats.proactive_waiting_block_deficit
+                ),
+                "vllm:num_proactive_no_candidate_cpu_capacity_rounds": (
+                    scheduler_stats.num_proactive_no_candidate_cpu_capacity_rounds
+                ),
+            }
+            for name, value in proactive_values.items():
+                self.proactive_pressure_metrics[name][engine_idx].set(value)
+
+            if scheduler_stats.kv_connector_stats is not None:
+                for key, metrics in self.offload_counter_metrics.items():
+                    value = scheduler_stats.kv_connector_stats.get(key)
+                    if isinstance(value, (int, float)) and value > 0:
+                        metrics[engine_idx].inc(value)
+                for key, metrics in self.offload_gauge_metrics.items():
+                    value = scheduler_stats.kv_connector_stats.get(key)
+                    if isinstance(value, (int, float)):
+                        metrics[engine_idx].set(value)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

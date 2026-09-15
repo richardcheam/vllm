@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 
 import torch
 
@@ -28,11 +29,13 @@ class DmaCopyBackend:
         self._load_params: BatchMemcpyParams | None = None
         self._load_stream: torch.cuda.Stream | None = None
         self._store_stream: torch.cuda.Stream | None = None
-        self._load_queue: queue.SimpleQueue | None = None
-        self._store_queue: queue.SimpleQueue | None = None
+        self._load_queue: queue.Queue | None = None
+        self._store_queue: queue.Queue | None = None
         self._load_thread: threading.Thread | None = None
         self._store_thread: threading.Thread | None = None
         self._shutdown: bool = False
+        self._failure: str | None = None
+        self._failure_lock = threading.Lock()
 
     def init(
         self,
@@ -48,8 +51,8 @@ class DmaCopyBackend:
         self._store_params = build_params(gpu_caches, cpu_caches, store_stream)
         self._load_params = build_params(cpu_caches, gpu_caches, load_stream)
 
-        self._load_queue = queue.SimpleQueue()
-        self._store_queue = queue.SimpleQueue()
+        self._load_queue = queue.Queue()
+        self._store_queue = queue.Queue()
         self._load_thread = threading.Thread(
             target=self._copy_loop,
             args=(self._load_queue, device, load_stream),
@@ -73,6 +76,14 @@ class DmaCopyBackend:
         events_list: list[tuple[int, torch.Event]],
         localities: list[str] | None = None,
     ) -> None:
+        if self._shutdown:
+            raise RuntimeError("DmaCopyBackend is shut down")
+        with self._failure_lock:
+            failure = self._failure
+        if failure is not None:
+            raise RuntimeError(
+                "DmaCopyBackend is unavailable after copy failure: " + failure
+            )
         params = self._store_params if is_store else self._load_params
         q = self._store_queue if is_store else self._load_queue
         assert params is not None and q is not None
@@ -90,24 +101,72 @@ class DmaCopyBackend:
             self._load_thread.join(timeout=5.0)
         if self._store_thread is not None:
             self._store_thread.join(timeout=5.0)
+        self._load_params = None
+        self._store_params = None
+        self._load_stream = None
+        self._store_stream = None
+        self._load_queue = None
+        self._store_queue = None
 
-    @staticmethod
+    def flush(self) -> None:
+        """Wait until queued copies have submitted their CUDA events."""
+        for kind, work_queue, thread in (
+            ("load", self._load_queue, self._load_thread),
+            ("store", self._store_queue, self._store_thread),
+        ):
+            if work_queue is None:
+                continue
+            while work_queue.unfinished_tasks:
+                self.check_health()
+                if thread is not None and not thread.is_alive():
+                    raise RuntimeError(
+                        f"DmaCopyBackend {kind} thread exited with queued work"
+                    )
+                time.sleep(0.01)
+        self.check_health()
+
+    def check_health(self) -> None:
+        """Raise the first background copy failure, if one occurred."""
+        with self._failure_lock:
+            failure = self._failure
+        if failure is not None:
+            raise RuntimeError(
+                "DmaCopyBackend is unavailable after copy failure: " + failure
+            )
+
     def _copy_loop(
-        q: queue.SimpleQueue,
+        self,
+        q: queue.Queue,
         device: torch.device,
         stream: torch.cuda.Stream,
     ) -> None:
-        current_platform.set_device(device)
-        while True:
-            item = q.get()
-            if item is None:
-                return
-            src_blocks, dst_blocks, params, event_idx, events_list, localities = item
-            _ = localities
-            copy_blocks(src_blocks, dst_blocks, params)
-            event = torch.Event()
-            event.record(stream)
-            events_list.append((event_idx, event))
+        try:
+            current_platform.set_device(device)
+            while True:
+                item = q.get()
+                if item is None:
+                    q.task_done()
+                    return
+                try:
+                    src_blocks, dst_blocks, params, event_idx, events_list, localities = item
+                    _ = localities
+                    copy_blocks(src_blocks, dst_blocks, params)
+                    event = torch.Event()
+                    event.record(stream)
+                    events_list.append((event_idx, event))
+                except Exception as exc:
+                    with self._failure_lock:
+                        if self._failure is None:
+                            self._failure = f"{type(exc).__name__}: {exc}"
+                    logger.exception("DmaCopyBackend copy operation failed")
+                    raise
+                finally:
+                    q.task_done()
+        except Exception as exc:
+            with self._failure_lock:
+                if self._failure is None:
+                    self._failure = f"{type(exc).__name__}: {exc}"
+            logger.exception("DmaCopyBackend copy thread failed")
 
 
 class InlineCopyBackend:
@@ -153,4 +212,14 @@ class InlineCopyBackend:
         events_list.append((event_idx, event))
 
     def shutdown(self) -> None:
+        self._load_params = None
+        self._store_params = None
+        self._load_stream = None
+        self._store_stream = None
+        return
+
+    def flush(self) -> None:
+        return
+
+    def check_health(self) -> None:
         return

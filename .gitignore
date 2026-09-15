@@ -212,6 +212,10 @@ cython_debug/
 *.log.profile
 logs/
 benchmark_artifacts/
+heavy_offload_artifacts/
+opt125m_cuda_artifacts/
+watchdog_artifacts/
+failure_artifacts/
 observability/data/
 observability/node_exporter_textfile/*.prom
 docs/benchmarking/*_quick.json

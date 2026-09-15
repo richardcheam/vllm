@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -236,30 +236,58 @@ class KVCacheManager:
         This is used as an admission gate to prevent over-admitting requests
         when chunked prefill would otherwise only check the first chunk.
         """
-        if new_computed_blocks is not None:
-            new_computed_block_list = new_computed_blocks.blocks
-        else:
-            new_computed_block_list = self.empty_kv_cache_blocks.blocks
-
-        num_local_computed_tokens = (
-            request.num_computed_tokens + num_new_computed_tokens
-        )
-        total_computed_tokens = min(
-            num_local_computed_tokens + num_external_computed_tokens,
-            self.max_model_len,
-        )
-        full_num_tokens = min(request.num_tokens, self.max_model_len)
-
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        num_blocks_to_allocate = self.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=full_num_tokens,
-            new_computed_blocks=new_computed_block_list,
+            num_tokens=min(request.num_tokens, self.max_model_len),
+            new_computed_blocks=new_computed_blocks,
+            num_new_computed_tokens=num_new_computed_tokens,
+            num_external_computed_tokens=num_external_computed_tokens,
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=total_computed_tokens,
-            num_tokens_main_model=full_num_tokens,
+            total_computed_tokens=(
+                request.num_computed_tokens
+                + num_new_computed_tokens
+                + num_external_computed_tokens
+            ),
+            num_tokens_main_model=min(request.num_tokens, self.max_model_len),
         )
 
         return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        num_new_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+        num_encoder_tokens: int = 0,
+        total_computed_tokens: int = 0,
+        num_tokens_main_model: int | None = None,
+    ) -> int:
+        """Return the numeric block allocation estimate for a request.
+
+        This exposes the same calculation used by ``can_fit_full_sequence`` so
+        scheduler diagnostics can explain capacity waits without logging data
+        from the request itself.
+        """
+        if new_computed_blocks is None:
+            new_computed_block_list = self.empty_kv_cache_blocks.blocks
+        else:
+            new_computed_block_list = new_computed_blocks.blocks
+        if num_tokens_main_model is None:
+            num_tokens_main_model = num_tokens
+        return self.coordinator.get_num_blocks_to_allocate(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=(
+                total_computed_tokens
+                if total_computed_tokens > 0
+                else num_new_computed_tokens + num_external_computed_tokens
+            ),
+            num_tokens_main_model=num_tokens_main_model,
+        )
 
     def allocate_slots(
         self,
@@ -380,6 +408,7 @@ class KVCacheManager:
         self.coordinator.remove_skipped_blocks(
             request.request_id, total_computed_tokens
         )
+        allocation_snapshot = self._snapshot_request_allocation(request.request_id)
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
@@ -395,25 +424,42 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
-            )
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks until now to
+                # avoid the case where the new blocks cannot be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+        except ValueError as exc:
+            self._rollback_request_allocation(
+                request.request_id, allocation_snapshot
+            )
+            if str(exc).startswith("Cannot get "):
+                return None
+            raise
+        if new_blocks is None:
+            # The shared pool can change when computed/prefix blocks are
+            # attached just above. Treat a late shortage like any other
+            # schedulability miss instead of allowing a per-group allocator
+            # exception to terminate EngineCore.
+            self._rollback_request_allocation(
+                request.request_id, allocation_snapshot
+            )
+            return None
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -432,6 +478,82 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _snapshot_request_allocation(
+        self, request_id: str
+    ) -> tuple[
+        list[tuple[Any, list[KVCacheBlock], bool, int, dict[str, int] | None, set[str], int]],
+        list[int],
+    ]:
+        """Capture request-local KV state before a multi-group allocation."""
+        snapshot = []
+        for manager in self.coordinator.single_type_managers:
+            last_state = getattr(manager, "last_state_block_idx", None)
+            snapshot.append(
+                (
+                    manager,
+                    list(manager.req_to_blocks.get(request_id, [])),
+                    request_id in manager.num_cached_block,
+                    manager.num_cached_block.get(request_id, 0),
+                    dict(last_state) if last_state is not None else None,
+                    set(getattr(manager, "_allocated_block_reqs", set())),
+                )
+            )
+            snapshot[-1] += (len(manager.new_block_ids),)
+        return snapshot, [block.ref_cnt for block in self.block_pool.blocks]
+
+    def _rollback_request_allocation(
+        self,
+        request_id: str,
+        snapshot: tuple[
+            list[tuple[Any, list[KVCacheBlock], bool, int, dict[str, int] | None, set[str], int]],
+            list[int],
+        ],
+    ) -> None:
+        """Undo partial grouped allocation while retaining skipped-block cleanup."""
+        manager_snapshot, original_ref_counts = snapshot
+        for (
+            manager,
+            original_blocks,
+            cached_present,
+            cached_value,
+            original_last_state,
+            original_allocated_reqs,
+            original_new_block_ids_len,
+        ) in manager_snapshot:
+            current_blocks = manager.req_to_blocks.get(request_id)
+            if current_blocks is None:
+                continue
+            original_block_ids = {id(block) for block in original_blocks}
+            newly_allocated = [
+                block
+                for block in current_blocks
+                if id(block) not in original_block_ids and not block.is_null
+            ]
+            if newly_allocated:
+                manager.block_pool.free_blocks(newly_allocated)
+            current_blocks[:] = original_blocks
+            if cached_present:
+                manager.num_cached_block[request_id] = cached_value
+            else:
+                manager.num_cached_block.pop(request_id, None)
+            del manager.new_block_ids[original_new_block_ids_len:]
+            if original_last_state is not None:
+                manager.last_state_block_idx.clear()
+                manager.last_state_block_idx.update(original_last_state)
+            if hasattr(manager, "_allocated_block_reqs"):
+                manager._allocated_block_reqs = original_allocated_reqs
+
+        # Allocation can touch prefix-hit blocks before a later group runs out
+        # of capacity. Restore every extra reference, including references for
+        # blocks that were not newly appended to the request table.
+        for block, original_ref_count in zip(
+            self.block_pool.blocks, original_ref_counts, strict=True
+        ):
+            extra_refs = block.ref_cnt - original_ref_count
+            if extra_refs > 0:
+                for _ in range(extra_refs):
+                    self.block_pool.free_blocks([block])
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

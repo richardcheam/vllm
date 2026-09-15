@@ -143,6 +143,14 @@ class SchedulerConfig:
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
 
+    capacity_wait_timeout: float = Field(default=30.0, ge=0.0)
+    """Maximum seconds a capacity-blocked request may wait without progress.
+
+    A value of zero disables the stale-capacity timeout. The timeout only
+    applies when no request is running, so ordinary waits can recover while
+    active requests are still making progress.
+    """
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.

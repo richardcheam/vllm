@@ -31,7 +31,8 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
         ) -> str | list[int]:
             thinking = kwargs.get("thinking", False)
             enable_thinking = kwargs.get("enable_thinking", False)
-            thinking = thinking or enable_thinking
+            reasoning_effort = kwargs.get("reasoning_effort")
+            thinking = thinking or enable_thinking or reasoning_effort in ("high", "max")
             thinking_mode = "thinking" if thinking else "chat"
 
             conversation = kwargs.get("conversation", messages)
@@ -41,7 +42,6 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 messages[0]["tools"] = tools  # type: ignore[typeddict-unknown-key]
 
             # The V4 reference currently accepts only "max", "high", or None.
-            reasoning_effort = kwargs.get("reasoning_effort")
             if reasoning_effort not in ("max", "high"):
                 reasoning_effort = None
 

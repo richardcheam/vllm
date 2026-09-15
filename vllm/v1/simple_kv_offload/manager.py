@@ -63,6 +63,7 @@ class LoadRequestState:
     transfer_meta: TransferMeta
     load_event: int | None = None
     finished: bool = False
+    created_at_s: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -302,11 +303,32 @@ class SimpleCPUOffloadScheduler:
         self._telemetry_remote_swap_in_time_ms: float = 0.0
 
     @property
-    def telemetry_stats(self) -> dict[str, int]:
+    def telemetry_stats(self) -> dict[str, int | float]:
+        now = time.monotonic()
+
+        def oldest_age_ms(start_times: Iterable[float]) -> float:
+            oldest = min(start_times, default=now)
+            return max((now - oldest) * 1000.0, 0.0)
+
+        pending_load_wait_ms = oldest_age_ms(
+            state.created_at_s for state in self._reqs_to_load.values()
+        ) if self._reqs_to_load else 0.0
+        pending_load_age_ms = oldest_age_ms(
+            perf.started_at_s for perf in self._load_event_perf.values()
+        ) if self._load_event_perf else 0.0
+        pending_store_age_ms = oldest_age_ms(
+            perf.started_at_s for perf in self._store_event_perf.values()
+        ) if self._store_event_perf else 0.0
         return {
             "offload_pending_store_events": len(self._store_event_to_blocks),
             "offload_pending_load_reqs": len(self._reqs_to_load),
             "offload_pending_store_reqs": len(self._reqs_to_store),
+            "offload_pending_load_wait_ms": pending_load_wait_ms,
+            "offload_pending_load_age_ms": pending_load_age_ms,
+            "offload_pending_store_age_ms": pending_store_age_ms,
+            "offload_pending_transfer_age_ms": max(
+                pending_load_age_ms, pending_store_age_ms
+            ),
             "offload_store_events": self._telemetry_store_events,
             "offload_load_events": self._telemetry_load_events,
             "offload_store_blocks": self._telemetry_store_blocks,
@@ -362,7 +384,7 @@ class SimpleCPUOffloadScheduler:
             f"num_remote_fallbacks_gpu_{self._gpu_rank}": self._telemetry_num_remote_fallbacks,
         }
 
-    def take_telemetry_stats(self) -> dict[str, int]:
+    def take_telemetry_stats(self) -> dict[str, int | float]:
         stats = self.telemetry_stats
         self._telemetry_store_events = 0
         self._telemetry_load_events = 0
@@ -1280,6 +1302,7 @@ class SimpleCPUOffloadScheduler:
         """Process a fully-completed store event."""
         transfer = self._store_event_to_blocks.pop(event_idx)
         self._pending_request_ids_by_store_event.pop(event_idx, [])
+        event_req_ids = self._store_event_to_reqs.pop(event_idx, [])
         if transfer.cpu_block_ids:
             self._locality_planner.release_block_ids(
                 transfer.cpu_block_ids,
@@ -1316,7 +1339,11 @@ class SimpleCPUOffloadScheduler:
             len(transfer.cpu_block_ids),
         )
 
-        for req_id in self._store_event_to_reqs.pop(event_idx, []):
+        # A finished request may have taken temporary GPU references while
+        # preparing its final store. Store completion releases the transfer's
+        # own GPU references. The finish-time references remain separate and
+        # are released by _cleanup_store_request().
+        for req_id in event_req_ids:
             state = self._reqs_to_store.get(req_id)
             if state is None:
                 continue
@@ -1520,6 +1547,18 @@ class SimpleCPUOffloadScheduler:
         state = self._reqs_to_store.pop(req_id, None)
         if state is None:
             return
+
+        # request_finished() temporarily touches GPU blocks so a final lazy
+        # store cannot race with normal request cleanup. If no store event was
+        # created for some of those blocks, release the residual references
+        # here or they become permanently unavailable to the allocator.
+        if state.finish_touched_gpu_block_ids and self._gpu_block_pool is not None:
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[block_id]
+                for block_id in state.finish_touched_gpu_block_ids
+            )
+            state.finish_touched_gpu_block_ids.clear()
+
         for event_idx in list(state.store_events):
             if (reqs := self._store_event_to_reqs.get(event_idx)) is not None:
                 with contextlib.suppress(ValueError):

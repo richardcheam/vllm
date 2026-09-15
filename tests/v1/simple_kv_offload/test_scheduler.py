@@ -450,6 +450,10 @@ def test_simple_offload_telemetry_stats_roundtrip() -> None:
     assert stats["offload_store_blocks"] > 0
     assert stats["offload_store_bytes"] > 0
     assert stats["offload_pending_store_events"] >= 1
+    assert stats["offload_pending_load_wait_ms"] == 0.0
+    assert stats["offload_pending_load_age_ms"] == 0.0
+    assert stats["offload_pending_store_age_ms"] >= 0.0
+    assert stats["offload_pending_transfer_age_ms"] >= stats["offload_pending_store_age_ms"]
 
     taken = sched.take_telemetry_stats()
     assert taken["offload_store_events"] == 1
@@ -617,6 +621,7 @@ def test_simple_offload_stats_aggregate_keeps_gauges_latest() -> None:
             "offload_store_blocks": 2,
             "offload_store_bytes": 100,
             "offload_pending_store_events": 3,
+            "offload_pending_transfer_age_ms": 11.0,
             "offload_cpu_total_blocks": 8,
             "offload_pin_memory_fix": 1,
         }
@@ -627,6 +632,7 @@ def test_simple_offload_stats_aggregate_keeps_gauges_latest() -> None:
             "offload_store_blocks": 5,
             "offload_store_bytes": 200,
             "offload_pending_store_events": 1,
+            "offload_pending_transfer_age_ms": 7.0,
             "offload_cpu_total_blocks": 8,
             "offload_pin_memory_fix": 1,
         }
@@ -638,6 +644,7 @@ def test_simple_offload_stats_aggregate_keeps_gauges_latest() -> None:
     assert merged["offload_store_blocks"] == 7
     assert merged["offload_store_bytes"] == 300
     assert merged["offload_pending_store_events"] == 1
+    assert merged["offload_pending_transfer_age_ms"] == 7.0
     assert merged["offload_cpu_total_blocks"] == 8
     assert merged["offload_pin_memory_fix"] == 1
 
@@ -1378,13 +1385,17 @@ def test_eager_store_preemption_cleanup() -> None:
     assert store_event in store_state.store_events
 
     # Finish request while store still in-flight -> deferred
-    sched.request_finished(req, block_ids=[])
+    sched.request_finished(req, block_ids=block_ids[0])
     assert req.request_id in sched._reqs_to_store
     assert sched._reqs_to_store[req.request_id].finished is True
+
+    # Normal scheduler cleanup releases the request's ownership reference.
+    fix.gpu_block_pool.free_blocks(kv_blocks.blocks[0])
 
     # Simulate store completion -> deferred cleanup fires
     simulate_store_completion(sched, store_event)
     assert req.request_id not in sched._reqs_to_store
+    assert fix.gpu_block_pool.get_num_free_blocks() == 15
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1651,61 @@ def test_request_finished_flushes_confirmed_store_blocks_under_pressure() -> Non
     fix.gpu_block_pool.free_blocks(fillers)
 
 
+def test_request_finished_releases_unstored_finish_touches() -> None:
+    """Lazy finish cleanup must not leak temporary GPU block references."""
+    fix = make_scheduler(
+        num_cpu_blocks=8,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    # Force lazy tracking and finish-time touches while under pressure.
+    fillers = fix.gpu_block_pool.get_new_blocks(3)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    assert get_cpu_free_blocks(sched) == sched.num_cpu_blocks - 1
+
+    sched.request_finished(req, block_ids=kv_blocks.get_block_ids()[0])
+    # The normal request cleanup releases the allocation reference. The
+    # finish-time touch remains until connector cleanup handles it.
+    fix.gpu_block_pool.free_blocks(kv_blocks.blocks[0])
+    fix.gpu_block_pool.free_blocks(fillers)
+    assert get_cpu_free_blocks(sched) == sched.num_cpu_blocks - 1
+    meta = sched.build_connector_meta(make_scheduler_output({}))
+
+    assert meta.store_event < 0
+    assert req.request_id not in sched._reqs_to_store
+    assert fix.gpu_block_pool.get_num_free_blocks() == 7
+
+
+def test_repeated_lazy_finish_cleanup_does_not_deplete_gpu_pool() -> None:
+    """Repeated finish cleanup must preserve all reusable GPU blocks."""
+    fix = make_scheduler(
+        num_cpu_blocks=16,
+        num_gpu_blocks=8,
+        lazy=True,
+        proactive_swap_budget=2,
+    )
+    sched = fix.scheduler
+
+    for index in range(64):
+        req = make_request(num_blocks=2, request_id=f"repeat-cleanup-{index}")
+        kv_blocks = _alloc_and_register(fix, req, 2)
+        fillers = fix.gpu_block_pool.get_new_blocks(3)
+        sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+        sched.request_finished(req, block_ids=kv_blocks.get_block_ids()[0])
+        fix.gpu_block_pool.free_blocks(kv_blocks.blocks[0])
+        fix.gpu_block_pool.free_blocks(fillers)
+        sched.build_connector_meta(make_scheduler_output({}))
+
+        assert fix.gpu_block_pool.get_num_free_blocks() == 7
+        assert req.request_id not in sched._reqs_to_store
+
+
 def test_request_finished_all_groups_flushes_confirmed_store_blocks() -> None:
     """HMA finish path should flush confirmed blocks for all KV groups."""
     fix = make_scheduler(
@@ -1850,4 +1916,56 @@ def test_has_pending_transfers_tracks_load_lifecycle() -> None:
     assert sched.has_pending_transfers() is True
 
     simulate_load_completion(sched, {req2.request_id})
+
+
+def test_store_completion_waits_for_all_workers() -> None:
+    """A store is committed only after every TP worker reports completion."""
+    fix = make_scheduler(num_cpu_blocks=8, num_gpu_blocks=16, lazy=False)
+    sched = fix.scheduler
+    sched._expected_worker_count = 2
+
+    req = make_request(num_blocks=2)
+    kv_blocks = _alloc_and_register(fix, req, 2)
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 2 * BLOCK_SIZE},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    assert meta.store_event >= 0
+
+    event_idx = meta.store_event
+    transfer = sched._store_event_to_blocks[event_idx]
+    cpu_hash = fix.scheduler.cpu_block_pool.blocks[
+        transfer.cpu_block_ids[0]
+    ].block_hash
+    assert cpu_hash is not None
+
+    # One worker's completion must not expose a partially copied CPU prefix.
+    sched.update_connector_output(
+        KVConnectorOutput(
+            finished_recving=set(),
+            kv_connector_worker_meta=SimpleCPUOffloadWorkerMetadata(
+                completed_store_events={event_idx: 1},
+            ),
+        )
+    )
+    assert sched._store_event_pending_counts[event_idx] == 1
+    assert event_idx in sched._store_event_to_blocks
+    assert sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(cpu_hash) is None
+    assert sched.has_pending_transfers() is True
+
+    # The second worker completes the event and makes the CPU prefix visible.
+    sched.update_connector_output(
+        KVConnectorOutput(
+            finished_recving=set(),
+            kv_connector_worker_meta=SimpleCPUOffloadWorkerMetadata(
+                completed_store_events={event_idx: 1},
+            ),
+        )
+    )
+    assert event_idx not in sched._store_event_pending_counts
+    assert event_idx not in sched._store_event_to_blocks
+    assert sched.cpu_block_pool.cached_block_hash_to_block.get_one_block(cpu_hash) is not None
     assert sched.has_pending_transfers() is False

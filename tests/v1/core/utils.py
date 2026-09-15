@@ -54,6 +54,7 @@ def create_scheduler(
     max_model_len: int | None = None,
     num_speculative_tokens: int | None = None,
     proactive_swap_budget: int = 0,
+    capacity_wait_timeout: float = 30.0,
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
@@ -90,6 +91,7 @@ def create_scheduler(
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         proactive_swap_budget=proactive_swap_budget,
+        capacity_wait_timeout=capacity_wait_timeout,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
     )

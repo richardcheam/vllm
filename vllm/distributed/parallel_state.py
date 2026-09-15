@@ -1902,6 +1902,12 @@ def destroy_distributed_environment():
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+    """Tear down distributed state and release process-local allocators.
+
+    This helper is intentionally process-local. It can release CUDA memory only
+    in the process that owns the CUDA context; it does not reset devices or
+    perform any host-level operation.
+    """
     # Reset environment variable cache
     envs.disable_envs_cache()
 
@@ -1918,23 +1924,38 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     # Ensure all objects are not frozen before cleanup
     gc.unfreeze()
 
-    destroy_model_parallel()
-    destroy_distributed_environment()
+    try:
+        destroy_model_parallel()
+    except Exception:
+        logger.exception("Model-parallel cleanup failed")
+    try:
+        destroy_distributed_environment()
+    except Exception:
+        logger.exception("Distributed-environment cleanup failed")
     if shutdown_ray:
         import ray  # Lazy import Ray
 
-        ray.shutdown()
-    gc.collect()
+        try:
+            ray.shutdown()
+        except Exception:
+            logger.exception("Ray cleanup failed")
+    try:
+        gc.collect()
+    except Exception:
+        logger.exception("Garbage collection failed during cleanup")
     from vllm.platforms import current_platform
 
     if not current_platform.is_cpu():
-        torch.accelerator.empty_cache()
+        with contextlib.suppress(Exception):
+            torch.accelerator.empty_cache()
         try:
             torch._C._host_emptyCache()
         except AttributeError:
             logger.warning(
                 "torch._C._host_emptyCache() only available in Pytorch >=2.5"
             )
+        except Exception:
+            logger.exception("Host allocator cleanup failed")
 
 
 def in_the_same_node_as(

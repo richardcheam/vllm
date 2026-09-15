@@ -97,3 +97,27 @@ class DeepSeekV3ReasoningWithThinkingParser(DeepSeekV3ReasoningParser):
             chat_kwargs["enable_thinking"] = True
             kwargs["chat_template_kwargs"] = chat_kwargs
         super().__init__(tokenizer, *args, **kwargs)
+
+
+class DeepSeekV4ReasoningParser(DeepSeekV3ReasoningParser):
+    """DeepSeek-V4 parser with stable thinking delimiters.
+
+    The parser still selects identity mode unless the request explicitly enables
+    thinking, but the delimiters are exposed unconditionally so the engine can
+    initialize reasoning token IDs at startup.
+    """
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
+        chat_kwargs = dict(kwargs.get("chat_template_kwargs", {}) or {})
+        if chat_kwargs.get("reasoning_effort") in ("high", "max"):
+            chat_kwargs["thinking"] = True
+            kwargs["chat_template_kwargs"] = chat_kwargs
+        super().__init__(tokenizer, *args, **kwargs)
+
+    @property
+    def reasoning_start_str(self) -> str:
+        return "<think>"
+
+    @property
+    def reasoning_end_str(self) -> str:
+        return "</think>"

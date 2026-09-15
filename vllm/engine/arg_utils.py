@@ -660,6 +660,7 @@ class EngineArgs:
     async_scheduling: bool | None = SchedulerConfig.async_scheduling
 
     stream_interval: int = SchedulerConfig.stream_interval
+    capacity_wait_timeout: float = SchedulerConfig.capacity_wait_timeout
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
@@ -1374,6 +1375,10 @@ class EngineArgs:
             **scheduler_kwargs["scheduler_reserve_full_isl"],
         )
         scheduler_group.add_argument(
+            "--capacity-wait-timeout",
+            **scheduler_kwargs["capacity_wait_timeout"],
+        )
+        scheduler_group.add_argument(
             "--proactive-swap-budget", **scheduler_kwargs["proactive_swap_budget"]
         )
         scheduler_group.add_argument("--vlt-alpha", **scheduler_kwargs["vlt_alpha"])
@@ -2007,6 +2012,7 @@ class EngineArgs:
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
+            capacity_wait_timeout=self.capacity_wait_timeout,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

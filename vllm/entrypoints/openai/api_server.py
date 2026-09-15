@@ -559,8 +559,16 @@ def setup_server(args):
     # many concurrent requests active
     set_ulimit()
 
-    def signal_handler(*_) -> None:
+    def signal_handler(signum, _) -> None:
         # Interrupt server on sigterm while initializing
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = f"SIGNAL_{signum}"
+        logger.warning(
+            "Received shutdown signal %s while API server was initializing",
+            signal_name,
+        )
         raise KeyboardInterrupt("terminated")
 
     signal.signal(signal.SIGTERM, signal_handler)

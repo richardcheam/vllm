@@ -177,6 +177,7 @@ class SchedulerStats:
     num_running_reqs: int = 0
 
     num_waiting_reqs: int = 0  # length of the "waiting" request queue
+    num_capacity_waiting_reqs: int = 0  # subset blocked by full-sequence capacity
     num_skipped_waiting_reqs: int = 0  # length of the "skipped waiting" queue
     num_preempted_reqs: int = 0
 
@@ -192,7 +193,11 @@ class SchedulerStats:
     num_proactive_cpu_capacity_skips: int = 0
     num_proactive_no_candidate_rounds: int = 0
     num_proactive_cpu_pressure_skips: int = 0
+    num_proactive_no_candidate_cpu_capacity_rounds: int = 0
     proactive_locality_penalty_ms: int = 0
+    proactive_waiting_required_blocks: int = 0
+    proactive_waiting_free_blocks: int = 0
+    proactive_waiting_block_deficit: int = 0
 
     num_waiting_for_remote_kv_reqs: int = 0
     num_remote_wait_entries: int = 0
@@ -210,6 +215,14 @@ class SchedulerStats:
     kv_cache_total_blocks: int = 0
     kv_cache_used_blocks: int = 0
     kv_cache_free_blocks: int = 0
+
+    # Numeric diagnostics for requests blocked by full-sequence KV admission.
+    capacity_wait_max_prompt_tokens: int = 0
+    capacity_wait_max_current_tokens: int = 0
+    capacity_wait_max_output_tokens: int = 0
+    capacity_wait_max_required_blocks: int = 0
+    capacity_wait_free_blocks: int = 0
+    capacity_wait_max_block_deficit: int = 0
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None

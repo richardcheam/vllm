@@ -27,7 +27,7 @@ from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
-from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
+from vllm.v1.utils import describe_process, get_engine_client_zmq_addr, shutdown
 
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
@@ -151,6 +151,7 @@ class CoreEngineProcManager:
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
+        self.failed_proc_status: dict[str, int | str | bool | None] | None = None
 
         try:
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
@@ -210,6 +211,12 @@ class CoreEngineProcManager:
                 exitcode = proc.exitcode
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
+                    self.failed_proc_status = describe_process(proc)
+                    logger.error(
+                        "Engine core process failed: name=%s status=%s",
+                        proc.name,
+                        self.failed_proc_status,
+                    )
             if died_sentinels:
                 # Any engine exit currently triggers a shutdown. Future
                 # work (e.g., Elastic and fault-tolerant EP) will add finer-grained
@@ -227,6 +234,15 @@ class CoreEngineProcManager:
             proc.name: proc.exitcode
             for proc in self.processes
             if proc.exitcode is not None
+        }
+
+    def process_statuses(
+        self, wait_timeout: float = 0.0
+    ) -> dict[str, dict[str, int | str | bool | None]]:
+        """Return diagnostics for every managed engine core process."""
+        return {
+            proc.name: describe_process(proc, wait_timeout=wait_timeout)
+            for proc in self.processes
         }
 
 
@@ -1172,13 +1188,25 @@ def wait_for_engine_startup(
             continue
         if len(events) > 1 or events[0][0] != handshake_socket:
             # One of the local core processes exited.
-            finished = proc_manager.finished_procs() if proc_manager else {}
+            event_fds = {event[0] for event in events}
+            statuses = {}
+            if proc_manager:
+                for proc in proc_manager.processes:
+                    wait_timeout = 5.0 if proc.sentinel in event_fds else 0.0
+                    statuses[proc.name] = describe_process(proc, wait_timeout)
+            finished = {
+                name: status["exitcode"]
+                for name, status in statuses.items()
+                if status["exitcode"] is not None
+            }
             if coord_process is not None and coord_process.exitcode is not None:
                 finished[coord_process.name] = coord_process.exitcode
+            if coord_process is not None:
+                statuses[coord_process.name] = describe_process(coord_process)
             raise RuntimeError(
                 "Engine core initialization failed. "
                 "See root cause above. "
-                f"Failed core proc(s): {finished}"
+                f"Failed core proc(s): {finished}; process status: {statuses}"
             )
 
         # Receive HELLO and READY messages from the input socket.

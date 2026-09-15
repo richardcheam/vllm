@@ -27,7 +27,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
+from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
@@ -61,6 +61,7 @@ from vllm.utils.system_utils import (
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.utils import describe_process
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -112,6 +113,9 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        self.failed_worker_statuses: dict[
+            str, dict[str, int | str | bool | None]
+        ] = {}
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -242,6 +246,11 @@ class MultiprocExecutor(Executor):
                         uw.death_writer.close()
                         uw.death_writer = None
                 self._ensure_worker_termination([uw.proc for uw in unready_workers])
+                for uw in unready_workers:
+                    uw.ready_pipe.close()
+                if self.rpc_broadcast_mq is not None:
+                    self.rpc_broadcast_mq.close()
+                    self.rpc_broadcast_mq = None
 
         self.output_rank = self._get_output_rank()
 
@@ -279,9 +288,16 @@ class MultiprocExecutor(Executor):
                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
                 return
             _self.is_failed = True
-            proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
+            _self.failed_worker_statuses = {
+                h.proc.name: describe_process(h.proc, wait_timeout=0.1)
+                for h in workers
+            }
+            proc_name = next(h.proc.name for h in workers if h.proc.sentinel in died)
             logger.error(
-                "Worker proc %s died unexpectedly, shutting down executor.", proc_name
+                "Worker proc %s died unexpectedly, shutting down executor. "
+                "statuses=%s",
+                proc_name,
+                _self.failed_worker_statuses,
             )
             _self.shutdown()
             callback = _self.failure_callback
@@ -457,14 +473,17 @@ class MultiprocExecutor(Executor):
                     # Shutdown response queues
                     if w.worker_response_mq is not None:
                         w.worker_response_mq.shutdown()
+                        w.worker_response_mq.close()
                         w.worker_response_mq = None
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()
+            rpc_broadcast_mq.close()
             self.rpc_broadcast_mq = None
         if response_mqs := getattr(self, "response_mqs", None):
             for mq in response_mqs:
                 mq.shutdown()
+                mq.close()
             self.response_mqs = []
 
     def check_health(self) -> None:
@@ -587,7 +606,15 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        self.worker: WorkerWrapperBase | None = None
+        self.rpc_broadcast_mq: MessageQueue | None = None
+        self.worker_response_mq: MessageQueue | None = None
+        self.peer_response_handles: list[Handle] = []
+        self._shutdown_complete = False
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
+        # Keep the wrapper reachable while its constructor is running so a
+        # failure during init_device() can still release distributed state.
+        self.worker = wrapper
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
             {} for _ in range(vllm_config.parallel_config.world_size)
@@ -600,45 +627,53 @@ class WorkerProc:
             "is_driver_worker": is_driver_worker,
             "shared_worker_lock": shared_worker_lock,
         }
-        wrapper.init_worker(all_kwargs)
-        self.worker = wrapper
+        try:
+            wrapper.init_worker(all_kwargs)
 
-        self.setup_proc_title_and_log_prefix(
-            enable_ep=vllm_config.parallel_config.enable_expert_parallel
-        )
-
-        # Load model
-        self.worker.init_device()
-        # Update process title now that parallel groups are initialized
-        self.setup_proc_title_and_log_prefix(
-            enable_ep=vllm_config.parallel_config.enable_expert_parallel
-        )
-        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
-            self.worker.elastic_ep_execute("load_model")
-        else:
-            self.worker.load_model()
-
-        scheduler_config = vllm_config.scheduler_config
-        self.use_async_scheduling = scheduler_config.async_scheduling
-        if self.use_async_scheduling:
-            self.async_output_queue: queue.Queue = queue.Queue()
-            self.async_output_copy_thread = Thread(
-                target=self.async_output_busy_loop,
-                daemon=True,
-                name="WorkerAsyncOutputCopy",
+            self.setup_proc_title_and_log_prefix(
+                enable_ep=vllm_config.parallel_config.enable_expert_parallel
             )
-            self.async_output_copy_thread.start()
 
-        # Set block size based on the attention backends
-        current_platform.update_block_size_for_backend(vllm_config)
+            # Load model
+            self.worker.init_device()
+            # Update process title now that parallel groups are initialized
+            self.setup_proc_title_and_log_prefix(
+                enable_ep=vllm_config.parallel_config.enable_expert_parallel
+            )
+            if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                self.worker.elastic_ep_execute("load_model")
+            else:
+                self.worker.load_model()
 
-        # Initialize message queues after init_device() since multi-node setups
-        # (nnodes_within_dp > 1) require distributed groups to be initialized
-        self._init_message_queues(input_shm_handle, vllm_config)
+            scheduler_config = vllm_config.scheduler_config
+            self.use_async_scheduling = scheduler_config.async_scheduling
+            if self.use_async_scheduling:
+                self.async_output_queue: queue.Queue = queue.Queue()
+                self.async_output_copy_thread = Thread(
+                    target=self.async_output_busy_loop,
+                    daemon=True,
+                    name="WorkerAsyncOutputCopy",
+                )
+                self.async_output_copy_thread.start()
 
-        # Enable environment variable cache (e.g. assume no more
-        # environment variable overrides after this point)
-        enable_envs_cache()
+            # Set block size based on the attention backends
+            current_platform.update_block_size_for_backend(vllm_config)
+
+            # Initialize message queues after init_device() since multi-node setups
+            # (nnodes_within_dp > 1) require distributed groups to be initialized
+            self._init_message_queues(input_shm_handle, vllm_config)
+
+            # Enable environment variable cache (e.g. assume no more
+            # environment variable overrides after this point)
+            enable_envs_cache()
+        except BaseException:
+            logger.exception(
+                "WorkerProc initialization failed: rank=%s pid=%s; cleaning up",
+                rank,
+                os.getpid(),
+            )
+            self.shutdown()
+            raise
 
     @staticmethod
     def make_worker_process(
@@ -718,11 +753,6 @@ class WorkerProc:
     def wait_for_ready(
         unready_proc_handles: list[UnreadyWorkerProcHandle],
     ) -> list[WorkerProcHandle]:
-        e = Exception(
-            "WorkerProc initialization failed due to an exception in a "
-            "background process. See stack trace for root cause."
-        )
-
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
@@ -736,15 +766,33 @@ class WorkerProc:
                     unready_proc_handle = pipes.pop(pipe)
                     response: dict[str, Any] = pipe.recv()
                     if response["status"] != "READY":
-                        raise e
+                        statuses = {
+                            handle.proc.name: describe_process(handle.proc)
+                            for handle in unready_proc_handles
+                        }
+                        raise RuntimeError(
+                            "WorkerProc returned a non-READY startup status: "
+                            f"{response['status']}; process status: {statuses}"
+                        )
 
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
                     ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )
                 except EOFError:
-                    e.__suppress_context__ = True
-                    raise e from None
+                    statuses = {
+                        handle.proc.name: describe_process(handle.proc)
+                        for handle in unready_proc_handles
+                    }
+                    logger.error(
+                        "WorkerProc startup pipe closed before READY: statuses=%s",
+                        statuses,
+                    )
+                    raise RuntimeError(
+                        "WorkerProc initialization failed due to an exception in a "
+                        "background process. See stack trace for root cause. "
+                        f"process status: {statuses}"
+                    ) from None
 
                 finally:
                     # Close connection.
@@ -753,15 +801,28 @@ class WorkerProc:
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
-        if self.rpc_broadcast_mq is not None:
-            self.rpc_broadcast_mq.shutdown()
-        if self.worker_response_mq is not None:
-            self.worker_response_mq.shutdown()
-        self.worker.shutdown()
-        self.rpc_broadcast_mq = None
-        self.worker_response_mq = None
-        destroy_model_parallel()
-        destroy_distributed_environment()
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        logger.info("WorkerProc shutdown begin: rank=%s pid=%s", self.rank, os.getpid())
+        try:
+            for message_queue in (
+                self.rpc_broadcast_mq,
+                self.worker_response_mq,
+            ):
+                if message_queue is not None:
+                    message_queue.shutdown()
+                    message_queue.close()
+            worker = self.worker
+            if worker is not None:
+                with suppress(Exception):
+                    worker.shutdown()
+        finally:
+            self.rpc_broadcast_mq = None
+            self.worker_response_mq = None
+            with suppress(Exception):
+                cleanup_dist_env_and_memory()
+            logger.info("WorkerProc shutdown complete: rank=%s pid=%s", self.rank, os.getpid())
 
     def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
         if death_pipe is None:
@@ -877,11 +938,20 @@ class WorkerProc:
             # any worker dies. Set this value so we don't re-throw
             # SystemExit() to avoid zmq exceptions in __del__.
             shutdown_requested.set()
+            # Preserve the non-zero child exit status for startup failures. At
+            # runtime, keep the existing RPC behavior: the exception is sent
+            # back to the caller and the worker remains usable.
+            if ready_writer is not None:
+                raise
 
         except SystemExit as e:
             # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that
             # the graceful shutdown process did not succeed
-            logger.warning("WorkerProc was terminated")
+            logger.warning(
+                "WorkerProc was terminated: rank=%s pid=%s",
+                kwargs.get("rank", "unknown"),
+                os.getpid(),
+            )
             # SystemExit must never be ignored
             raise e
 
@@ -893,6 +963,12 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            # Worker construction can fail before WorkerProc receives a
+            # completed WorkerWrapperBase. In that case the wrapper cannot
+            # perform its own teardown, so clean process-local distributed and
+            # allocator state here as a final safety net.
+            with suppress(Exception):
+                cleanup_dist_env_and_memory()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()

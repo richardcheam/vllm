@@ -10,7 +10,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, InlineCopyBackend
-from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor, unpin_tensor
 from vllm.v1.simple_kv_offload.layout import (
     LayoutModeDecision,
     OffloadLayoutDescriptor,
@@ -55,6 +55,7 @@ class SimpleCPUOffloadWorker:
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
         self._block_first_slab: torch.Tensor | None = None
+        self._pinned_cpu_tensors: list[torch.Tensor] = []
 
         # CUDA streams for the async transfers
         self.load_stream: torch.cuda.Stream | None = None
@@ -181,6 +182,7 @@ class SimpleCPUOffloadWorker:
             slab = torch.zeros((self.num_cpu_blocks, block_span), dtype=torch.int8, device="cpu")
             if pin_memory:
                 pin_tensor(slab)
+                self._pinned_cpu_tensors.append(slab)
             self._block_first_slab = slab
 
             cursor = 0
@@ -199,6 +201,7 @@ class SimpleCPUOffloadWorker:
                 tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
                 if pin_memory:
                     pin_tensor(tensor)
+                    self._pinned_cpu_tensors.append(tensor)
                 self.cpu_kv_caches[name] = tensor
 
         # Use lowest priority so KV cache I/O yields to compute streams.
@@ -266,6 +269,7 @@ class SimpleCPUOffloadWorker:
             - finished_sending: always None (stores use worker metadata).
             - finished_recving: req_ids whose loads have completed.
         """
+        self._backend.check_health()
         # (1) Submit transfers
         metadata = self._connector_metadata
         if metadata is not None:
@@ -333,6 +337,7 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
+        self._backend.flush()
         for event_idx, event in self._load_events:
             event.synchronize()
             self._load_hwm = event_idx
@@ -342,6 +347,42 @@ class SimpleCPUOffloadWorker:
             event.synchronize()
             self._store_hwm = event_idx
         self._store_events.clear()
+
+    def shutdown(self) -> None:
+        """Stop copy workers and release CPU/GPU transfer resources."""
+        logger.info(
+            "SimpleCPUOffloadWorker shutdown: pending_load_events=%d "
+            "pending_store_events=%d queued_load_events=%d queued_store_events=%d",
+            len(self._pending_load_event_indices),
+            len(self._pending_store_event_indices),
+            len(self._load_events),
+            len(self._store_events),
+        )
+        try:
+            self._flush_and_sync_all()
+        except Exception:
+            logger.exception(
+                "Failed to synchronize SimpleCPUOffload transfers during shutdown"
+            )
+        try:
+            self._backend.shutdown()
+        finally:
+            for tensor in self._pinned_cpu_tensors:
+                try:
+                    unpin_tensor(tensor)
+                except Exception:
+                    logger.exception("Failed to unregister pinned CPU KV tensor")
+            self._pinned_cpu_tensors.clear()
+            self._connector_metadata = None
+            self._pending_load_event_indices.clear()
+            self._pending_store_event_indices.clear()
+            self._completed_store_events.clear()
+            self.gpu_kv_caches = None
+            self.cpu_kv_caches = None
+            self._block_first_slab = None
+            self.layout_descriptor = None
+            self.load_stream = None
+            self.store_stream = None
 
     def _poll_stream_events(self, is_store: bool) -> int:
         """Non-blocking poll for completed events and return the high-water mark."""

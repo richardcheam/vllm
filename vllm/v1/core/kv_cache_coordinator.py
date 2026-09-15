@@ -155,7 +155,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
-    ) -> tuple[list[KVCacheBlock], ...]:
+    ) -> tuple[list[KVCacheBlock], ...] | None:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
         token slots.
@@ -173,16 +173,84 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
-        return tuple(
-            manager.allocate_new_blocks(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+        # Prefix/computed blocks may have been attached immediately before this
+        # call. Recompute the remaining per-group demand against the shared
+        # pool so grouped allocation cannot partially consume blocks and then
+        # raise when a later group sees the pool as empty.
+        remaining_blocks = 0
+        for manager in self.single_type_managers:
+            if isinstance(manager, CrossAttentionManager):
+                remaining_blocks += manager.get_num_blocks_to_allocate(
+                    request_id, num_encoder_tokens, [], 0, num_encoder_tokens
+                )
+            else:
+                remaining_blocks += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    [],
+                    num_tokens,
+                    num_tokens_main_model,
+                )
+        if remaining_blocks > self.block_pool.get_num_free_blocks():
+            return None
+
+        # Allocation is shared by all KV groups. Keep the request tables and
+        # per-manager zeroing lists transactional because a late pool change
+        # must not leave earlier groups partially allocated.
+        snapshots = [
+            (
+                manager,
+                list(manager.req_to_blocks.get(request_id, [])),
+                len(manager.new_block_ids),
+                (
+                    dict(manager.last_state_block_idx)
+                    if hasattr(manager, "last_state_block_idx")
+                    else None
+                ),
+                set(getattr(manager, "_allocated_block_reqs", set())),
             )
             for manager in self.single_type_managers
-        )
+        ]
+        try:
+            allocated: list[list[KVCacheBlock]] = []
+            for manager in self.single_type_managers:
+                allocated.append(
+                    manager.allocate_new_blocks(
+                        request_id,
+                        num_encoder_tokens
+                        if isinstance(manager, CrossAttentionManager)
+                        else num_tokens,
+                        num_tokens_main_model,
+                    )
+                )
+            return tuple(allocated)
+        except ValueError as exc:
+            for (
+                manager,
+                original_blocks,
+                original_new_block_ids_len,
+                original_last_state_block_idx,
+                original_allocated_block_reqs,
+            ) in snapshots:
+                current_blocks = manager.req_to_blocks.get(request_id, [])
+                original_block_ids = {id(block) for block in original_blocks}
+                newly_allocated = [
+                    block
+                    for block in current_blocks
+                    if id(block) not in original_block_ids and not block.is_null
+                ]
+                if newly_allocated:
+                    manager.block_pool.free_blocks(newly_allocated)
+                current_blocks[:] = original_blocks
+                del manager.new_block_ids[original_new_block_ids_len:]
+                if original_last_state_block_idx is not None:
+                    manager.last_state_block_idx.clear()
+                    manager.last_state_block_idx.update(original_last_state_block_idx)
+                if hasattr(manager, "_allocated_block_reqs"):
+                    manager._allocated_block_reqs = original_allocated_block_reqs
+            if str(exc).startswith("Cannot get "):
+                return None
+            raise
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

@@ -1159,6 +1159,7 @@ def test_startup_failure(monkeypatch: pytest.MonkeyPatch):
         )
 
     assert "Engine core initialization failed" in str(e_info.value)
+    assert "process status" in str(e_info.value)
 
 
 @create_new_process_for_each_test()

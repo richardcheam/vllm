@@ -30,7 +30,7 @@ _REASONING_PARSERS_TO_REGISTER = {
     ),
     "deepseek_v4": (
         "deepseek_v3_reasoning_parser",
-        "DeepSeekV3ReasoningParser",
+        "DeepSeekV4ReasoningParser",
     ),
     "ernie45": (
         "ernie45_reasoning_parser",

@@ -169,7 +169,11 @@ def run_headless(args: argparse.Namespace):
     # Catch SIGTERM and SIGINT to allow graceful shutdown.
     def signal_handler(signum, frame):
         nonlocal shutdown_requested
-        logger.debug("Received %d signal.", signum)
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = f"SIGNAL_{signum}"
+        logger.warning("Received shutdown signal %s", signal_name)
         if not shutdown_requested:
             shutdown_requested = True
             raise SystemExit
@@ -241,7 +245,11 @@ def run_multi_api_server(args: argparse.Namespace):
     # Catch SIGTERM and SIGINT to allow graceful shutdown.
     def signal_handler(signum, frame):
         nonlocal shutdown_requested
-        logger.debug("Received %d signal.", signum)
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = f"SIGNAL_{signum}"
+        logger.warning("Received shutdown signal %s", signal_name)
         if not shutdown_requested:
             shutdown_requested = True
             raise SystemExit

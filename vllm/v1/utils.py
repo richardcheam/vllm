@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import multiprocessing
+import signal
 import threading
 import time
 import weakref
@@ -39,6 +40,32 @@ if TYPE_CHECKING:
     from vllm.v1.engine.utils import CoreEngineActorManager, CoreEngineProcManager
 
 logger = init_logger(__name__)
+
+
+def describe_process(
+    proc: BaseProcess, wait_timeout: float = 0.0
+) -> dict[str, int | str | bool | None]:
+    """Return stable diagnostics for a multiprocessing child process."""
+    # A sentinel may become ready just before multiprocessing has refreshed
+    # ``exitcode``. A short join lets failure diagnostics capture the status
+    # without delaying the normal liveness monitor.
+    with contextlib.suppress(AssertionError, ValueError):
+        proc.join(timeout=wait_timeout)
+    exitcode = proc.exitcode
+    terminating_signal: str | None = None
+    if exitcode is not None and exitcode < 0:
+        with contextlib.suppress(ValueError):
+            terminating_signal = signal.Signals(-exitcode).name
+    try:
+        alive = proc.is_alive()
+    except (AssertionError, ValueError):
+        alive = False
+    return {
+        "pid": proc.pid,
+        "exitcode": exitcode,
+        "signal": terminating_signal,
+        "alive": alive,
+    }
 
 T = TypeVar("T")
 
@@ -311,9 +338,10 @@ def wait_for_completion_or_failure(
                         f"died with exit code {proc.exitcode}"
                     )
                 if engine_manager and engine_manager.failed_proc_name is not None:
+                    status = getattr(engine_manager, "failed_proc_status", None)
                     raise RuntimeError(
                         f"Engine core process {engine_manager.failed_proc_name} "
-                        "died unexpectedly."
+                        f"died unexpectedly; status={status}."
                     )
 
     except KeyboardInterrupt:
@@ -355,6 +383,9 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
     for proc in procs:
         if proc.is_alive() and (pid := proc.pid) is not None:
             kill_process_tree(pid)
+    for proc in procs:
+        with contextlib.suppress(AssertionError, ValueError):
+            proc.join(timeout=1.0)
 
 
 def copy_slice(

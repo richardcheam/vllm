@@ -5,6 +5,7 @@ import pytest
 
 from vllm.v1.core.kv_cache_utils import check_enough_kv_cache_memory
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.utils import describe_process
 
 
 def test_kv_cache_oom_no_memory():
@@ -52,3 +53,24 @@ def test_kv_cache_oom_insufficient_memory(monkeypatch):
 
     with pytest.raises(ValueError):
         check_enough_kv_cache_memory(config, spec, 1024**3)  # 1 GiB
+
+
+def test_describe_process_includes_signal_and_exit_status():
+    class FakeProcess:
+        pid = 1234
+        exitcode = -9
+
+        def join(self, timeout):
+            assert timeout == 0
+
+        def is_alive(self):
+            return False
+
+    status = describe_process(FakeProcess())  # type: ignore[arg-type]
+
+    assert status == {
+        "pid": 1234,
+        "exitcode": -9,
+        "signal": "SIGKILL",
+        "alive": False,
+    }

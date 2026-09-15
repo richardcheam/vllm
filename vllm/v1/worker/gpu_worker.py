@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    cleanup_dist_env_and_memory,
     get_pp_group,
     get_tp_group,
 )
@@ -1006,19 +1007,58 @@ class Worker(WorkerBase):
         torch.accelerator.synchronize()
 
     def shutdown(self) -> None:
-        # has_kv_transfer_group can be None during interpreter shutdown.
-        if ensure_kv_transfer_shutdown is not None:
-            ensure_kv_transfer_shutdown()
-        if self.profiler is not None:
-            self.profiler.shutdown()
+        memory_before = None
+        if self.device_config.device_type == "cuda":
+            with contextlib.suppress(Exception):
+                memory_before = torch.cuda.mem_get_info(self.device)
+        logger.info(
+            "GPU worker shutdown begin: rank=%s pid=%s memory=%s",
+            self.rank,
+            os.getpid(),
+            memory_before,
+        )
 
-        if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
-            weight_transfer_engine.shutdown()
+        try:
+            # has_kv_transfer_group can be None during interpreter shutdown.
+            if ensure_kv_transfer_shutdown is not None:
+                try:
+                    ensure_kv_transfer_shutdown()
+                except Exception:
+                    logger.exception("GPU worker KV-transfer cleanup failed")
+            try:
+                if self.profiler is not None:
+                    self.profiler.shutdown()
+            except Exception:
+                logger.exception("GPU worker profiler cleanup failed")
 
-        # Release GPU resources held by the model runner so that memory
-        # can be reclaimed when running in-process
-        if model_runner := getattr(self, "model_runner", None):
-            model_runner.shutdown()
+            try:
+                if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
+                    weight_transfer_engine.shutdown()
+            except Exception:
+                logger.exception("GPU worker weight-transfer cleanup failed")
+
+            # Release GPU resources held by the model runner so that memory
+            # can be reclaimed when running in-process.
+            if model_runner := getattr(self, "model_runner", None):
+                try:
+                    model_runner.shutdown()
+                except Exception:
+                    logger.exception("GPU worker model-runner cleanup failed")
+        finally:
+            try:
+                cleanup_dist_env_and_memory()
+            except Exception:
+                logger.exception("GPU worker distributed/memory cleanup failed")
+        memory_after = None
+        if self.device_config.device_type == "cuda":
+            with contextlib.suppress(Exception):
+                memory_after = torch.cuda.mem_get_info(self.device)
+        logger.info(
+            "GPU worker shutdown complete: rank=%s pid=%s memory=%s",
+            self.rank,
+            os.getpid(),
+            memory_after,
+        )
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

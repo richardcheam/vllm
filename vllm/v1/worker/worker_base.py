@@ -208,8 +208,9 @@ class WorkerWrapperBase:
         self.vllm_config: VllmConfig
 
     def shutdown(self) -> None:
-        if self.worker is not None:
-            self.worker.shutdown()
+        worker = getattr(self, "worker", None)
+        if worker is not None:
+            worker.shutdown()
 
     def update_environment_variables(
         self,

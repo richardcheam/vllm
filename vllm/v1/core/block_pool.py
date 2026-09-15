@@ -415,11 +415,18 @@ class BlockPool:
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        blocks_to_append: list[KVCacheBlock] = []
+        appended_ids: set[int] = set()
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+            if (
+                block.ref_cnt == 0
+                and not block.is_null
+                and block.block_id not in appended_ids
+            ):
+                blocks_to_append.append(block)
+                appended_ids.add(block.block_id)
+        self.free_block_queue.append_n(blocks_to_append)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

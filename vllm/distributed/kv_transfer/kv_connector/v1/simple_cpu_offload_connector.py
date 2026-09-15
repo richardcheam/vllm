@@ -50,6 +50,10 @@ class SimpleCPUOffloadConnectorStats(KVConnectorStats):
         "offload_pending_store_events",
         "offload_pending_load_reqs",
         "offload_pending_store_reqs",
+        "offload_pending_load_wait_ms",
+        "offload_pending_load_age_ms",
+        "offload_pending_store_age_ms",
+        "offload_pending_transfer_age_ms",
         "offload_store_events",
         "offload_load_events",
         "offload_store_blocks",
@@ -68,6 +72,17 @@ class SimpleCPUOffloadConnectorStats(KVConnectorStats):
         "offload_store_events_lt_4_blocks",
         "offload_load_events_ge_16_blocks",
         "offload_load_events_lt_4_blocks",
+        "local_swap_out_bytes",
+        "local_swap_in_bytes",
+        "remote_swap_out_bytes",
+        "remote_swap_in_bytes",
+        "num_remote_fallbacks",
+        "swap_out_time_ms",
+        "swap_in_time_ms",
+        "local_swap_out_time_ms",
+        "local_swap_in_time_ms",
+        "remote_swap_out_time_ms",
+        "remote_swap_in_time_ms",
     )
 
     def reset(self):
@@ -145,6 +160,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
+        self._last_pending_transfers = False
 
         if not enable_prefix_caching:
             logger.warning(
@@ -252,6 +268,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self.worker_handler is not None:
             return self.worker_handler.build_connector_worker_meta()
         return None
+
+    def shutdown(self) -> None:
+        """Stop worker-side transfer resources before the CUDA worker exits."""
+        if self.worker_handler is not None:
+            self.worker_handler.shutdown()
 
     # --- Scheduler-side methods ---
 
@@ -365,7 +386,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         stats = SimpleCPUOffloadConnectorStats(
             data=self.scheduler_manager.take_telemetry_stats()
         )
-        if stats.is_empty():
+        pending_transfers = self.scheduler_manager.has_pending_transfers()
+        emit_zero_snapshot = self._last_pending_transfers and not pending_transfers
+        self._last_pending_transfers = pending_transfers
+        if stats.is_empty() and not emit_zero_snapshot:
             return None
         return stats
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+import pytest
 import torch
 
 from vllm.v1.simple_kv_offload import copy_backend
@@ -119,3 +120,32 @@ def test_inline_copy_backend_submits_immediately_without_threads(monkeypatch) ->
         ("copy", ((5,), (6,), "params-load")),
         ("copy", ((7,), (8,), "params-store")),
     ]
+
+
+def test_dma_copy_backend_surfaces_copy_thread_failures(monkeypatch) -> None:
+    def fake_build_params(src_caches, dst_caches, stream: FakeStream) -> str:
+        return f"params-{stream.name}"
+
+    def failing_copy_blocks(src_blocks, dst_blocks, params) -> None:
+        raise RuntimeError("synthetic copy failure")
+
+    monkeypatch.setattr(copy_backend.current_platform, "set_device", lambda device: None)
+    monkeypatch.setattr(copy_backend, "build_params", fake_build_params)
+    monkeypatch.setattr(copy_backend, "copy_blocks", failing_copy_blocks)
+
+    backend = copy_backend.DmaCopyBackend()
+    backend.init(
+        {"layer": object()},
+        {"layer": object()},
+        torch.device("cpu"),
+        FakeStream("load"),  # type: ignore[arg-type]
+        FakeStream("store"),  # type: ignore[arg-type]
+    )
+    try:
+        backend.launch_copy(
+            [1], [2], is_store=True, event_idx=1, events_list=[]
+        )
+        with pytest.raises(RuntimeError, match="synthetic copy failure"):
+            backend.flush()
+    finally:
+        backend.shutdown()

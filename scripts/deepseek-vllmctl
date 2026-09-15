@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Control the DeepSeek vLLM user service without shadowing the native vLLM CLI.
+SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SERVICE_NAME="deepseek-vllm.service"
+UNIT_SOURCE="${REPO_ROOT}/systemd/${SERVICE_NAME}"
+USER_UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+UNIT_TARGET="${USER_UNIT_DIR}/${SERVICE_NAME}"
+USER_BIN_DIR="${HOME}/.local/bin"
+COMMAND_TARGET="${USER_BIN_DIR}/deepseek-vllmctl"
+STATE_DIR="${VLLM_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/deepseek-vllm}"
+MAINTENANCE_HOLD="${STATE_DIR}/maintenance"
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/config/reasoning-tree-superinfer.env}"
+
+usage() {
+  cat <<'EOF'
+Usage: deepseek-vllmctl <command> [options]
+
+Service commands:
+  install       Install the user systemd unit, disabled and not started
+  uninstall     Remove the installed user systemd unit
+  enable        Enable automatic service start at user-manager startup
+  disable       Disable automatic start and stop the service
+  start         Start automatic service supervision
+  stop          Stop the service and create a development hold
+  pause         Stop the service and create a development hold
+  resume        Remove the development hold and start supervision
+  status        Show hold state and systemd service status
+  logs          Follow service journal logs
+
+The native model-serving CLI remains at .venv/bin/vllm.
+EOF
+}
+
+require_unit() {
+  if [[ ! -e "${UNIT_TARGET}" ]]; then
+    printf 'User service is not installed. Run: deepseek-vllmctl install\n' >&2
+    exit 1
+  fi
+}
+
+systemd_reload() {
+  systemctl --user daemon-reload
+}
+
+create_hold() {
+  umask 077
+  mkdir -p "${STATE_DIR}"
+  : > "${MAINTENANCE_HOLD}"
+}
+
+remove_hold() {
+  rm -f "${MAINTENANCE_HOLD}"
+}
+
+stop_scoped_server() {
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    printf 'Missing launch configuration: %s\n' "${CONFIG_FILE}" >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source "${CONFIG_FILE}"
+  set +a
+  CONTAINER_NAME="${CONTAINER_NAME:-richard-base-dev-sysnice}" \
+    PORT="${PORT:-8202}" \
+    bash "${REPO_ROOT}/stop.sh"
+}
+
+command="${1:-}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "${command}" in
+  install)
+    mkdir -p "${USER_UNIT_DIR}" "${USER_BIN_DIR}" "${STATE_DIR}"
+    if [[ -e "${COMMAND_TARGET}" || -L "${COMMAND_TARGET}" ]]; then
+      if [[ "$(realpath "${COMMAND_TARGET}" 2>/dev/null || true)" != "${SCRIPT_PATH}" ]]; then
+        printf 'Refusing to replace existing command: %s\n' "${COMMAND_TARGET}" >&2
+        exit 1
+      fi
+    fi
+    ln -sfn "${SCRIPT_PATH}" "${COMMAND_TARGET}"
+    ln -sfn "${UNIT_SOURCE}" "${UNIT_TARGET}"
+    systemd_reload
+    printf 'Installed command: %s\n' "${COMMAND_TARGET}"
+    printf 'Installed user unit: %s (disabled and not started).\n' "${SERVICE_NAME}"
+    printf 'Ensure %s is in PATH, then run: deepseek-vllmctl enable\n' "${USER_BIN_DIR}"
+    ;;
+  uninstall)
+    if systemctl --user is-active --quiet "${SERVICE_NAME}"; then
+      printf '%s is active; run deepseek-vllmctl disable first.\n' "${SERVICE_NAME}" >&2
+      exit 1
+    fi
+    rm -f "${UNIT_TARGET}"
+    systemd_reload
+    if [[ "$(realpath "${COMMAND_TARGET}" 2>/dev/null || true)" == "${SCRIPT_PATH}" ]]; then
+      rm -f "${COMMAND_TARGET}"
+    fi
+    printf 'Removed %s and its user command link.\n' "${SERVICE_NAME}"
+    ;;
+  enable)
+    require_unit
+    remove_hold
+    systemctl --user enable "${SERVICE_NAME}"
+    printf 'Enabled %s. Start with: deepseek-vllmctl start\n' "${SERVICE_NAME}"
+    ;;
+  disable)
+    require_unit
+    create_hold
+    systemctl --user disable --now "${SERVICE_NAME}" || true
+    stop_scoped_server
+    printf 'Disabled %s and created maintenance hold: %s\n' \
+      "${SERVICE_NAME}" "${MAINTENANCE_HOLD}"
+    ;;
+  start)
+    require_unit
+    if [[ -e "${MAINTENANCE_HOLD}" ]]; then
+      printf 'Maintenance hold is active: %s\nRun: deepseek-vllmctl resume\n' \
+        "${MAINTENANCE_HOLD}" >&2
+      exit 1
+    fi
+    systemctl --user start "${SERVICE_NAME}"
+    ;;
+  stop|pause)
+    require_unit
+    create_hold
+    systemctl --user stop "${SERVICE_NAME}" || true
+    stop_scoped_server
+    printf 'Stopped %s; maintenance hold active: %s\n' \
+      "${SERVICE_NAME}" "${MAINTENANCE_HOLD}"
+    ;;
+  resume)
+    require_unit
+    remove_hold
+    systemctl --user start "${SERVICE_NAME}"
+    ;;
+  status)
+    if [[ -e "${MAINTENANCE_HOLD}" ]]; then
+      printf 'maintenance_hold=active path=%s\n' "${MAINTENANCE_HOLD}"
+    else
+      printf 'maintenance_hold=inactive path=%s\n' "${MAINTENANCE_HOLD}"
+    fi
+    systemctl --user status "${SERVICE_NAME}" --no-pager
+    ;;
+  logs)
+    require_unit
+    exec journalctl --user -u "${SERVICE_NAME}" -f
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    if [[ ! -x "${REPO_ROOT}/.venv/bin/vllm" ]]; then
+      printf 'Unknown command and checkout CLI not found: %s\n' "${command}" >&2
+      usage >&2
+      exit 2
+    fi
+    exec "${REPO_ROOT}/.venv/bin/vllm" "${command}" "$@"
+    ;;
+esac

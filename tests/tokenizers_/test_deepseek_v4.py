@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.entrypoints.chat_utils import parse_chat_messages
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.renderers.registry import RENDERER_REGISTRY
+from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
+from vllm.reasoning.deepseek_v3_reasoning_parser import DeepSeekV4ReasoningParser
 from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
 from vllm.tokenizers.registry import TokenizerRegistry
 
@@ -20,6 +23,9 @@ class FakeHfTokenizer:
 
     def get_added_vocab(self) -> dict[str, int]:
         return {"</think>": 100}
+
+    def get_vocab(self) -> dict[str, int]:
+        return {"<think>": 101, "</think>": 100}
 
     def encode(
         self,
@@ -182,17 +188,70 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert 'parameter name="arguments"' not in prompt
 
 
-@pytest.mark.parametrize("reasoning_effort", ["none", "low", "medium", "high"])
+@pytest.mark.parametrize("reasoning_effort", ["none", "low", "medium", "high", "max"])
 def test_deepseek_v4_accepts_openai_reasoning_effort_values(reasoning_effort):
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
-        enable_thinking=True,
         reasoning_effort=reasoning_effort,
     )
 
+    if reasoning_effort in ("high", "max"):
+        assert prompt.endswith("<｜Assistant｜><think>")
+    else:
+        assert prompt.endswith("<｜Assistant｜></think>")
+    assert ("Reasoning Effort: Absolute maximum" in prompt) == (reasoning_effort == "max")
+
+
+def test_deepseek_v4_parser_exposes_delimiters_and_thinking_mode():
+    tokenizer = _tokenizer()
+
+    parser = DeepSeekV4ReasoningParser(tokenizer)
+    assert parser.reasoning_start_str == "<think>"
+    assert parser.reasoning_end_str == "</think>"
+    assert not isinstance(parser._parser, DeepSeekR1ReasoningParser)
+
+    max_parser = DeepSeekV4ReasoningParser(
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": "max"},
+    )
+    assert isinstance(max_parser._parser, DeepSeekR1ReasoningParser)
+
+
+def test_deepseek_v4_top_level_max_effort_reaches_chat_template():
+    request = ChatCompletionRequest(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        messages=[{"role": "user", "content": "Hello"}],
+        reasoning_effort="max",
+        temperature=1.0,
+        top_p=0.95,
+    )
+    params = request.build_chat_params(None, "auto")
+    prompt = _tokenizer().apply_chat_template(
+        request.messages,
+        tokenize=False,
+        **params.chat_template_kwargs,
+    )
+
+    assert params.chat_template_kwargs["reasoning_effort"] == "max"
+    assert prompt.startswith(
+        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    )
     assert prompt.endswith("<｜Assistant｜><think>")
-    assert "Reasoning Effort: Absolute maximum" not in prompt
+
+
+def test_deepseek_v4_parser_extracts_thinking_output():
+    parser = DeepSeekV4ReasoningParser(
+        _tokenizer(),
+        chat_template_kwargs={"thinking": True},
+    )
+    reasoning, content = parser.extract_reasoning(
+        "<think>analysis</think>answer",
+        ChatCompletionRequest(model="test", messages=[]),
+    )
+
+    assert reasoning == "analysis"
+    assert content == "answer"
 
 
 def test_deepseek_v4_preserves_reference_max_reasoning_effort():
