@@ -241,6 +241,12 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector",
     "SimpleCPUOffloadConnector",
 )
+
+KVConnectorFactory.register_connector(
+    "SuperInferConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.superinfer_connector",
+    "SuperInferConnector",
+)
 KVConnectorFactory.register_connector(
     "HF3FSKVConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",

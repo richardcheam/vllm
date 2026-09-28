@@ -91,6 +91,14 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             cpu_capacity_per_rank = explicit
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
+        cpu_kv_allocation_mode = str(
+            extra_config.get("cpu_kv_allocation_mode", "zero")
+        )
+        if cpu_kv_allocation_mode not in {"zero", "empty"}:
+            raise ValueError(
+                "cpu_kv_allocation_mode must be 'zero' or 'empty', got "
+                f"{cpu_kv_allocation_mode!r}"
+            )
 
         kv_offload_backend = str(extra_config.get("kv_offload_backend", "cpu"))
         if kv_offload_backend not in VALID_KV_OFFLOAD_BACKENDS:
@@ -169,6 +177,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 kv_cache_config,
                 cpu_capacity_per_rank,
                 kv_offload_backend=kv_offload_backend,
+                cpu_kv_allocation_mode=cpu_kv_allocation_mode,
                 disk_path=disk_path,
                 disk_capacity_bytes=disk_capacity_bytes,
                 disk_buffer_slots=disk_buffer_slots,

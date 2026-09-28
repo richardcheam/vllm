@@ -32,6 +32,7 @@ class SimpleCPUOffloadWorker:
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
         kv_offload_backend: str = "cpu",
+        cpu_kv_allocation_mode: str = "zero",
         disk_path: str | None = None,
         disk_capacity_bytes: int = 0,
         disk_buffer_slots: int = 2,
@@ -40,6 +41,7 @@ class SimpleCPUOffloadWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.cpu_capacity_bytes = cpu_capacity_bytes
+        self.cpu_kv_allocation_mode = cpu_kv_allocation_mode
         self.disk_path = disk_path
         self.disk_capacity_bytes = disk_capacity_bytes
         self.disk_buffer_slots = disk_buffer_slots
@@ -50,6 +52,10 @@ class SimpleCPUOffloadWorker:
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.device: torch.device | None = None
         self.num_cpu_blocks: int = 0
+        self._telemetry_store_events = 0
+        self._telemetry_load_events = 0
+        self._telemetry_store_bytes = 0
+        self._telemetry_load_bytes = 0
 
         # CUDA streams for the async transfers
         self.load_stream: torch.cuda.Stream | None = None
@@ -158,6 +164,7 @@ class SimpleCPUOffloadWorker:
             t.stride(0) * t.element_size() for t in unique_gpu_caches.values()
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
+        self.bytes_per_block = total_bytes_per_block
 
         self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // total_bytes_per_block)
 
@@ -229,7 +236,12 @@ class SimpleCPUOffloadWorker:
             # Allocate non-pinned first, then pin via cudaHostRegister to
             # bypass PyTorch's CUDACachingHostAllocator which rounds up to
             # the next power of 2 (e.g. 100 GB -> 128 GB).
-            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+            allocator = (
+                torch.empty
+                if self.cpu_kv_allocation_mode == "empty"
+                else torch.zeros
+            )
+            tensor = allocator(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
             if pin_memory:
                 pin_tensor(tensor)
             self.cpu_kv_caches[name] = tensor
@@ -272,6 +284,7 @@ class SimpleCPUOffloadWorker:
                 event_idx=metadata.load_event,
                 events_list=self._load_events,
             )
+            self._record_transfer(False, len(metadata.load_gpu_blocks))
 
     def wait_for_save(self) -> None:
         """Submit async stores.
@@ -300,7 +313,33 @@ class SimpleCPUOffloadWorker:
                 events_list=self._store_events,
                 wait_event=self._store_compute_done,
             )
+            self._record_transfer(True, len(metadata.store_gpu_blocks))
             self._store_submitted = True
+
+    def _record_transfer(self, is_store: bool, num_blocks: int) -> None:
+        if is_store:
+            self._telemetry_store_events += 1
+            self._telemetry_store_bytes += num_blocks * getattr(
+                self, "bytes_per_block", 0
+            )
+        else:
+            self._telemetry_load_events += 1
+            self._telemetry_load_bytes += num_blocks * getattr(
+                self, "bytes_per_block", 0
+            )
+
+    def take_superinfer_telemetry(self) -> dict[str, int]:
+        telemetry = {
+            "store_events": self._telemetry_store_events,
+            "load_events": self._telemetry_load_events,
+            "store_bytes": self._telemetry_store_bytes,
+            "load_bytes": self._telemetry_load_bytes,
+        }
+        self._telemetry_store_events = 0
+        self._telemetry_load_events = 0
+        self._telemetry_store_bytes = 0
+        self._telemetry_load_bytes = 0
+        return telemetry
 
     def get_finished(
         self, finished_req_ids: set[str]

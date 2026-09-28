@@ -253,6 +253,10 @@ class SimpleCPUOffloadScheduler:
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
+        self._telemetry_cpu_lookup_requests = 0
+        self._telemetry_cpu_lookup_hits = 0
+        self._telemetry_cpu_lookup_hit_tokens = 0
+        self._telemetry_boundary_last = BoundaryStoreStats()
 
     @staticmethod
     def _derive_cpu_config(
@@ -322,6 +326,8 @@ class SimpleCPUOffloadScheduler:
     ) -> tuple[int | None, bool]:
         """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
 
+        self._telemetry_cpu_lookup_requests += 1
+
         # Pins found CPU blocks so they survive LRU eviction until
         # update_state_after_alloc() consumes them. Any pin from an earlier
         # call on the same request (e.g. retry after a failed allocate_slots)
@@ -361,6 +367,8 @@ class SimpleCPUOffloadScheduler:
         )
 
         if hit_length > 0:
+            self._telemetry_cpu_lookup_hits += 1
+            self._telemetry_cpu_lookup_hit_tokens += hit_length
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
             ]
@@ -947,6 +955,47 @@ class SimpleCPUOffloadScheduler:
 
     def get_boundary_store_stats(self) -> BoundaryStoreStats:
         return replace(self.boundary_store_stats)
+
+    def take_superinfer_telemetry(self) -> dict[str, int | float]:
+        """Return a stable snapshot for optional connector telemetry."""
+        cpu_free = self.cpu_block_pool.get_num_free_blocks()
+        stats = self.get_boundary_store_stats()
+        previous = self._telemetry_boundary_last
+        boundary_deltas = {
+            "boundary_stores_published": self._counter_delta(
+                stats.published, previous.published
+            ),
+            "boundary_stores_stored": self._counter_delta(
+                stats.stored, previous.stored
+            ),
+            "boundary_stores_dropped_cpu_full": self._counter_delta(
+                stats.dropped_cpu_full, previous.dropped_cpu_full
+            ),
+            "boundary_stores_skipped_cached": self._counter_delta(
+                stats.skipped_already_cached, previous.skipped_already_cached
+            ),
+        }
+        snapshot = {
+            "cpu_lookup_requests": self._telemetry_cpu_lookup_requests,
+            "cpu_lookup_hits": self._telemetry_cpu_lookup_hits,
+            "cpu_lookup_hit_tokens": self._telemetry_cpu_lookup_hit_tokens,
+            "pending_store_events": len(self._store_event_to_blocks),
+            "pending_store_reqs": len(self._reqs_to_store),
+            "pending_load_reqs": len(self._reqs_to_load),
+            "cpu_total_blocks": self.num_cpu_blocks,
+            "cpu_free_blocks": cpu_free,
+            "cpu_used_blocks": self.num_cpu_blocks - cpu_free,
+            **boundary_deltas,
+        }
+        self._telemetry_cpu_lookup_requests = 0
+        self._telemetry_cpu_lookup_hits = 0
+        self._telemetry_cpu_lookup_hit_tokens = 0
+        self._telemetry_boundary_last = stats
+        return snapshot
+
+    @staticmethod
+    def _counter_delta(current: int, previous: int) -> int:
+        return current - previous if current >= previous else current
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Handle async transfer completions from worker.
